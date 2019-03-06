@@ -1,0 +1,11 @@
+[package]
+name = "hakelig"
+version = "0.0.1"
+authors = ["Andreas Rottmann <mail@r0tty.org>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.1"
+tokio = "0.1"
+url = "1.7"
+#reqwest = "0.9.11"
