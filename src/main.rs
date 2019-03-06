@@ -99,12 +99,13 @@ fn fetch_links(store: Arc<Store>, url: Arc<Url>, referrer: Arc<Url>) -> UrlStrea
 fn main() {
     let store = Arc::new(Store::new());
     let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
+    let find_store = Arc::clone(&store);
     let find_roots = dir_lister(".", Arc::new(|_| true))
         .filter_map(classify_path)
         .map(|entity| future::ok((entity.url(), entity.read_links())))
         .buffer_unordered(10)
         .map(move |(url, links)| {
-            let store = Arc::clone(&store);
+            let store = Arc::clone(&find_store);
             store
                 .resolve(Arc::clone(&url), HashSet::new())
                 .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
@@ -131,4 +132,8 @@ fn main() {
     }).map_err(|_| ());
     let run_both = future::lazy(|| tokio::spawn(consume)).and_then(|_| find_roots);
     tokio::run(run_both);
+    for (url, found, references) in store.lock().dangling() {
+        let references: Vec<_> = references.iter().map(|u| u.as_str()).collect();
+        println!("URL {} ({}): [{}]", url, found, references.join(", "));
+    }
 }

@@ -1,6 +1,6 @@
 use std::collections::{hash_map, HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use url::Url;
 
@@ -21,7 +21,10 @@ impl References {
         }
     }
     fn add_anchored(&mut self, anchor: Box<str>, referrer: Arc<Url>) {
-        self.anchored.entry(anchor).or_insert_with(Vec::new).push(referrer);
+        self.anchored
+            .entry(anchor)
+            .or_insert_with(Vec::new)
+            .push(referrer);
     }
     fn extend_anchored<I>(&mut self, anchor: Box<str>, referrers: I)
     where
@@ -137,4 +140,35 @@ impl Store {
             Some(url)
         }
     }
+    pub fn lock(&self) -> LockedStore {
+        LockedStore(self.0.lock().expect("mutex poisoned"))
+    }
+}
+
+pub struct LockedStore<'a>(MutexGuard<'a, StoreInner>);
+
+impl<'a> LockedStore<'a> {
+    pub fn dangling(&'a self) -> impl Iterator<Item = (&'a Url, bool, Vec<&'a Url>)> {
+        self.0
+            .unknown
+            .iter()
+            .map(unknown_dangling)
+            .chain(self.0.documents.iter().map(document_dangling))
+    }
+}
+
+fn unknown_dangling<'a>(
+    (url, references): (&'a Arc<Url>, &'a References),
+) -> (&'a Url, bool, Vec<&'a Url>) {
+    let anchored = &references.anchored;
+    let plain = &references.plain;
+    (
+        &url,
+        false,
+        anchored.values().flatten().map(|r| r.as_ref()).collect(),
+    )
+}
+
+fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> (&'a Url, bool, Vec<&'a Url>) {
+    unimplemented!()
 }
