@@ -1,11 +1,18 @@
+use std::collections::HashSet;
 use std::io;
-use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
+use failure::Error;
 use futures::{future, stream, Future, Stream};
+use futures::sink::Sink;
 use tokio::fs;
+use tokio::sync::mpsc;
 use url::Url;
+
+mod store;
+
+use store::Store;
 
 type PathStream = Box<dyn Stream<Item = Box<Path>, Error = io::Error> + Send>;
 
@@ -35,20 +42,33 @@ where
 }
 
 trait Entity {
+    fn url(&self) -> Arc<Url>;
     fn read_links(&self) -> Box<dyn Stream<Item = Url, Error = io::Error> + Send>;
 }
 
-struct HtmlPath(Box<Path>);
+struct HtmlPath {
+    path: Box<Path>,
+    url: Arc<Url>,
+}
 
 impl HtmlPath {
-    fn new<P: AsRef<Path>>(path: P) -> Self {
-        HtmlPath(path.as_ref().into())
+    fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let mut abs_path = std::env::current_dir()?;
+        abs_path.push(path);
+        let url = Url::from_file_path(&abs_path).expect("unrepresentable path");
+        Ok(HtmlPath {
+            path: abs_path.into(),
+            url: Arc::new(url),
+        })
     }
 }
 
 impl Entity for HtmlPath {
+    fn url(&self) -> Arc<Url> {
+        self.url.clone()
+    }
     fn read_links(&self) -> Box<dyn Stream<Item = Url, Error = io::Error> + Send> {
-        let links = fs::File::open(self.0.clone())
+        let links = fs::File::open(self.path.clone())
             .map(|file| stream::empty())
             .flatten_stream();
         Box::new(links)
@@ -59,23 +79,56 @@ fn classify_path(path: Box<Path>) -> Option<Box<dyn Entity>> {
     path.extension()
         .and_then(|ext| ext.to_str())
         .and_then(|ext| match ext {
-            "html" | "htm" => Some(Box::new(HtmlPath::new(&path)) as Box<Entity>),
+            "html" | "htm" => match HtmlPath::new(&path) {
+                Ok(entity) => Some(Box::new(entity) as Box<Entity>),
+                Err(_) => {
+                    eprintln!("could not represent filename {} as an URL", path.display());
+                    None
+                }
+            },
             _ => None,
         })
 }
 
+type UrlStream = Box<dyn Stream<Item = Arc<Url>, Error = io::Error> + Send>;
+
+fn fetch_links(store: Arc<Store>, url: Arc<Url>, referrer: Arc<Url>) -> UrlStream {
+    Box::new(stream::once(Ok(url)))
+}
+
 fn main() {
-    let task = dir_lister(".", Arc::new(|_| true))
+    let store = Arc::new(Store::new());
+    let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
+    let find_roots = dir_lister(".", Arc::new(|_| true))
         .filter_map(classify_path)
-        .map(|entity| future::ok(entity.read_links()))
+        .map(|entity| future::ok((entity.url(), entity.read_links())))
+        .buffer_unordered(10)
+        .map(move |(url, links)| {
+            let store = Arc::clone(&store);
+            store
+                .resolve(Arc::clone(&url), HashSet::new())
+                .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
+            links.map(move |link| {
+                if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
+                    future::ok(fetch_links(Arc::clone(&store), unknown_url, Arc::clone(&url)))
+                } else {
+                    future::ok(Box::new(stream::empty()) as UrlStream)
+                }
+            })
+        })
+        .flatten()
         .buffer_unordered(10)
         .flatten()
-        .for_each(|p| {
-            println!("found: {}", p);
-            future::ok(())
-        })
+        .map_err(Error::from)
+        .forward(url_sink)
+        .map(|(_, _)| ())
         .map_err(|e| {
             eprintln!("error: {}", e);
         });
-    tokio::run(task);
+    let consume = url_source.for_each(|url| {
+        println!("found: {}", url);
+        future::ok(())
+    }).map_err(|_| ());
+    let run_both = future::lazy(|| tokio::spawn(consume)).and_then(|_| find_roots);
+    tokio::run(run_both);
 }

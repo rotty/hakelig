@@ -5,6 +5,7 @@ authors = ["Andreas Rottmann <mail@r0tty.org>"]
 edition = "2018"
 
 [dependencies]
+failure = "0.1"
 futures = "0.1"
 tokio = "0.1"
 url = "1.7"
