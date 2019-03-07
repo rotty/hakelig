@@ -190,6 +190,50 @@ struct ExtractTask {
     chunk_source: mpsc::Receiver<Vec<u8>>,
 }
 
+impl ExtractTask {
+    fn run(
+        self,
+        store: Arc<Store>,
+        url_sink: mpsc::Sender<Arc<Url>>,
+    ) -> impl Future<Item = (), Error = Error> {
+        let url = self.url;
+        let store = Arc::clone(&store);
+        let resolve_store = Arc::clone(&store);
+        let resolve_url = Arc::clone(&url);
+        let operations = extract(self.chunk_source).filter_map(move |extracted| match extracted {
+            Extracted::Url(link) => {
+                if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
+                    Some(Operation::SinkUrl(unknown_url))
+                } else {
+                    None
+                }
+            }
+            Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
+        });
+        iterate(
+            operations,
+            HashSet::new(),
+            move |anchors| {
+                resolve_store
+                    .resolve(Arc::clone(&resolve_url), anchors)
+                    .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", resolve_url, e));
+            },
+            |op, mut anchors| match op {
+                Operation::AddAnchor(anchor) => {
+                    anchors.insert(anchor);
+                    (None, anchors)
+                }
+                Operation::SinkUrl(url) => (Some(url), anchors),
+            },
+        )
+        .filter_map(|item| item)
+        .fold(url_sink, move |url_sink, link| {
+            url_sink.send(link).map_err(Error::from)
+        })
+        .map(|_url_sink| ())
+    }
+}
+
 enum Operation {
     SinkUrl(Arc<Url>),
     AddAnchor(Box<str>),
@@ -233,56 +277,15 @@ where
     transformed
 }
 
-fn execute_extraction(
+fn extraction_thread(
     store: Arc<Store>,
     tasks: mpsc::Receiver<ExtractTask>,
     url_sink: mpsc::Sender<Arc<Url>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let extract = tasks
-            .map(|task| {
-                let url = task.url;
-                let store = Arc::clone(&store);
-                let resolve_store = Arc::clone(&store);
-                let resolve_url = Arc::clone(&url);
-                let operations =
-                    extract(task.chunk_source).filter_map(move |extracted| match extracted {
-                        Extracted::Url(link) => {
-                            if let Some(unknown_url) =
-                                store.add_link(Arc::new(link), Arc::clone(&url))
-                            {
-                                Some(Operation::SinkUrl(unknown_url))
-                            } else {
-                                None
-                            }
-                        }
-                        Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
-                    });
-                iterate(
-                    operations,
-                    HashSet::new(),
-                    move |anchors| {
-                        resolve_store
-                            .resolve(Arc::clone(&resolve_url), anchors)
-                            .unwrap_or_else(|e| {
-                                eprintln!("could not resolve {}: {}", resolve_url, e)
-                            });
-                    },
-                    |op, mut anchors| match op {
-                        Operation::AddAnchor(anchor) => {
-                            anchors.insert(anchor);
-                            (None, anchors)
-                        }
-                        Operation::SinkUrl(url) => (Some(url), anchors),
-                    },
-                )
-                .filter_map(|item| item)
-            })
-            .flatten()
-            .fold(url_sink, move |url_sink, link| {
-                url_sink.send(link).map_err(Error::from)
-            })
-            .map(|_url_sink| ());
+            .map_err(Error::from)
+            .for_each(|task| task.run(Arc::clone(&store), url_sink.clone()));
         current_thread::block_on_all(extract).unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
         });
@@ -314,7 +317,7 @@ fn main() {
         .map_err(|e| {
             eprintln!("error: {}", e);
         });
-    let task_executor = execute_extraction(Arc::clone(&store), task_source, url_sink);
+    let task_executor = extraction_thread(Arc::clone(&store), task_source, url_sink);
     let consume = url_source
         .for_each(|_url| {
             //println!("found: {}", url);
