@@ -13,6 +13,9 @@ struct References {
 }
 
 impl References {
+    fn is_empty(&self) -> bool {
+        self.anchored.is_empty() && self.plain.is_empty()
+    }
     fn add(&mut self, anchor: Option<Box<str>>, referrer: Arc<Url>) {
         if let Some(anchor) = anchor {
             self.add_anchored(anchor, referrer);
@@ -37,6 +40,9 @@ impl References {
     }
     fn into_inner(self) -> (HashMap<Box<str>, Vec<Arc<Url>>>, Vec<Arc<Url>>) {
         (self.anchored, self.plain)
+    }
+    fn referrers(&self) -> impl Iterator<Item = &Url> {
+        self.anchored.values().flatten().map(|r| r.as_ref()).chain(self.plain.iter().map(|r| r.as_ref()))
     }
 }
 
@@ -153,22 +159,24 @@ impl<'a> LockedStore<'a> {
             .unknown
             .iter()
             .map(unknown_dangling)
-            .chain(self.0.documents.iter().map(document_dangling))
+            .chain(self.0.documents.iter().filter_map(document_dangling))
     }
 }
 
 fn unknown_dangling<'a>(
     (url, references): (&'a Arc<Url>, &'a References),
 ) -> (&'a Url, bool, Vec<&'a Url>) {
-    let anchored = &references.anchored;
-    let plain = &references.plain;
     (
         &url,
         false,
-        anchored.values().flatten().map(|r| r.as_ref()).collect(),
+        references.referrers().collect()
     )
 }
 
-fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> (&'a Url, bool, Vec<&'a Url>) {
-    unimplemented!()
+fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Option<(&'a Url, bool, Vec<&'a Url>)> {
+    if document.unresolved.is_empty() {
+        None
+    } else {
+        Some((&url, true, document.unresolved.referrers().collect()))
+    }
 }
