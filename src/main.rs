@@ -81,35 +81,22 @@ enum Extracted {
 fn extract(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Extracted, Error = Error> {
     let queue = BufferQueue::new();
     let tokenizer = Tokenizer::new(ExtractSink::default(), TokenizerOpts::default());
-    stream::unfold(
-        (source, queue, tokenizer, false),
-        move |(source, mut queue, mut tokenizer, eof)| {
-            if eof {
-                None
-            } else {
-                let read = source.into_future().map(move |(item, rest)| {
-                    if let Some(buf) = item {
-                        let s = match std::str::from_utf8(&buf) {
-                            Ok(s) => s,
-                            // TODO: don't swallow error here
-                            Err(_) => return (Vec::new(), (rest, queue, tokenizer, true)),
-                        };
-                        queue.push_back(StrTendril::from_slice(s));
-                        let _ = tokenizer.feed(&mut queue); // TODO: check if ignoring result is OK
-                        (
-                            tokenizer.sink.0.drain(0..).collect(),
-                            (rest, queue, tokenizer, false),
-                        )
-                    } else {
-                        (Vec::new(), (rest, queue, tokenizer, true))
-                    }
-                });
-                Some(read)
-            }
+    iterate(
+        source,
+        (queue, tokenizer),
+        |_| (),
+        |buf, (mut queue, mut tokenizer)| {
+            let s = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                // TODO: don't swallow error here
+                Err(_) => return (Vec::new(), (queue, tokenizer)),
+            };
+            queue.push_back(StrTendril::from_slice(s));
+            let _ = tokenizer.feed(&mut queue); // TODO: check if ignoring result is OK
+            (tokenizer.sink.0.drain(0..).collect(), (queue, tokenizer))
         },
     )
     .map(|urls| stream::iter_ok(urls))
-    .map_err(|(e, _)| e)
     .flatten()
 }
 
@@ -208,6 +195,44 @@ enum Operation {
     AddAnchor(Box<str>),
 }
 
+// This is in some ways a mashup between `stream::unfold` and `Stream::fold`. It
+// threads a seed through some computation `step`, and when the stream is
+// exhausted, it calls `finish` on the final seed value.
+fn iterate<S, T, U, F, It>(
+    stream: S,
+    init: T,
+    finish: U,
+    step: F,
+) -> impl Stream<Item = It, Error = S::Error>
+where
+    S: Stream,
+    U: FnOnce(T) -> (),
+    F: FnMut(S::Item, T) -> (It, T),
+{
+    let transformed = stream::unfold(
+        (stream, init, step, finish, false),
+        move |(s, seed, mut step, finish, eof)| {
+            if eof {
+                finish(seed);
+                None
+            } else {
+                let next = s.into_future().map(move |(item, rest)| {
+                    if let Some(element) = item {
+                        let (element, seed) = step(element, seed);
+                        (Some(element), (rest, seed, step, finish, false))
+                    } else {
+                        (None, (rest, seed, step, finish, true))
+                    }
+                });
+                Some(next)
+            }
+        },
+    )
+    .filter_map(|item| item)
+    .map_err(|(e, _)| e);
+    transformed
+}
+
 fn execute_extraction(
     store: Arc<Store>,
     tasks: mpsc::Receiver<ExtractTask>,
@@ -233,37 +258,25 @@ fn execute_extraction(
                         }
                         Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
                     });
-                stream::unfold(
-                    (operations, HashSet::new(), false),
-                    move |(ops, mut anchors, eof)| {
-                        if eof {
-                            resolve_store
-                                .resolve(Arc::clone(&resolve_url), anchors)
-                                .unwrap_or_else(|e| {
-                                    eprintln!("could not resolve {}: {}", resolve_url, e)
-                                });
-                            None
-                        } else {
-                            let step = ops.into_future().map(move |(item, rest)| {
-                                if let Some(op) = item {
-                                    let url = match op {
-                                        Operation::AddAnchor(anchor) => {
-                                            anchors.insert(anchor);
-                                            None
-                                        }
-                                        Operation::SinkUrl(url) => Some(url),
-                                    };
-                                    (url, (rest, anchors, false))
-                                } else {
-                                    (None, (rest, anchors, true))
-                                }
+                iterate(
+                    operations,
+                    HashSet::new(),
+                    move |anchors| {
+                        resolve_store
+                            .resolve(Arc::clone(&resolve_url), anchors)
+                            .unwrap_or_else(|e| {
+                                eprintln!("could not resolve {}: {}", resolve_url, e)
                             });
-                            Some(step)
+                    },
+                    |op, mut anchors| match op {
+                        Operation::AddAnchor(anchor) => {
+                            anchors.insert(anchor);
+                            (None, anchors)
                         }
+                        Operation::SinkUrl(url) => (Some(url), anchors),
                     },
                 )
                 .filter_map(|item| item)
-                .map_err(|(e, _)| e)
             })
             .flatten()
             .fold(url_sink, move |url_sink, link| {
