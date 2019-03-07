@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::io;
-use std::iter::FromIterator;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -69,14 +68,19 @@ impl HtmlPath {
     }
 }
 
+enum Extracted {
+    Url(Url),
+    Anchor(Box<str>),
+}
+
 // We extract links by feeding chunks of data from a source channel into the
 // `html5ever` tokenizer, which is not `Send`. The reason to use a channel and
 // not an `AsyncRead` instance directly is that we want to use the tokio
 // threadpool runtime for the actual reading, so we can handle blocking disk
 // I/O, but cannot run the tokenizer inside the thread pool.
-fn extract_links(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Url, Error = Error> {
+fn extract(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Extracted, Error = Error> {
     let queue = BufferQueue::new();
-    let tokenizer = Tokenizer::new(LinkSink::default(), TokenizerOpts::default());
+    let tokenizer = Tokenizer::new(ExtractSink::default(), TokenizerOpts::default());
     stream::unfold(
         (source, queue, tokenizer, false),
         move |(source, mut queue, mut tokenizer, eof)| {
@@ -110,9 +114,9 @@ fn extract_links(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Url, Err
 }
 
 #[derive(Default)]
-struct LinkSink(Vec<Url>);
+struct ExtractSink(Vec<Extracted>);
 
-impl TokenSink for LinkSink {
+impl TokenSink for ExtractSink {
     type Handle = Option<Url>;
 
     fn process_token(&mut self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
@@ -122,15 +126,27 @@ impl TokenSink for LinkSink {
                 ref name,
                 ref attrs,
                 ..
-            }) if name == "a" => {
-                if let Some(href) = attrs.iter().find_map(|attr| {
-                    if attr.name.local == *"href" {
-                        Url::parse(&attr.value).ok()
+            }) => {
+                if name == "a" {
+                    if let Some(href) = attrs.iter().find_map(|attr| {
+                        if attr.name.local == *"href" {
+                            Url::parse(&attr.value).ok()
+                        } else {
+                            None
+                        }
+                    }) {
+                        self.0.push(Extracted::Url(href))
+                    }
+                }
+                if let Some(name) = attrs.iter().find_map(|attr| {
+                    let name = &attr.name.local;
+                    if name == "id" || name == "name" {
+                        Some(&attr.value)
                     } else {
                         None
                     }
                 }) {
-                    self.0.push(href)
+                    self.0.push(Extracted::Anchor(name.to_string().into()))
                 }
             }
             _ => {}
@@ -185,25 +201,69 @@ fn classify_path(path: Box<Path>) -> Option<Box<dyn Entity>> {
 struct ExtractTask {
     url: Arc<Url>,
     chunk_source: mpsc::Receiver<Vec<u8>>,
-    store: Arc<Store>,
+}
+
+enum Operation {
+    SinkUrl(Arc<Url>),
+    AddAnchor(Box<str>),
 }
 
 fn execute_extraction(
+    store: Arc<Store>,
     tasks: mpsc::Receiver<ExtractTask>,
     url_sink: mpsc::Sender<Arc<Url>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let extract = tasks
             .map(|task| {
-                let store = task.store;
                 let url = task.url;
-                extract_links(task.chunk_source).filter_map(move |link| {
-                    if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
-                        Some(unknown_url)
-                    } else {
-                        None
-                    }
-                })
+                let store = Arc::clone(&store);
+                let resolve_store = Arc::clone(&store);
+                let resolve_url = Arc::clone(&url);
+                let operations =
+                    extract(task.chunk_source).filter_map(move |extracted| match extracted {
+                        Extracted::Url(link) => {
+                            if let Some(unknown_url) =
+                                store.add_link(Arc::new(link), Arc::clone(&url))
+                            {
+                                Some(Operation::SinkUrl(unknown_url))
+                            } else {
+                                None
+                            }
+                        }
+                        Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
+                    });
+                stream::unfold(
+                    (operations, HashSet::new(), false),
+                    move |(ops, mut anchors, eof)| {
+                        if eof {
+                            resolve_store
+                                .resolve(Arc::clone(&resolve_url), anchors)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("could not resolve {}: {}", resolve_url, e)
+                                });
+                            None
+                        } else {
+                            let step = ops.into_future().map(move |(item, rest)| {
+                                if let Some(op) = item {
+                                    let url = match op {
+                                        Operation::AddAnchor(anchor) => {
+                                            anchors.insert(anchor);
+                                            None
+                                        }
+                                        Operation::SinkUrl(url) => Some(url),
+                                    };
+                                    (url, (rest, anchors, false))
+                                } else {
+                                    (None, (rest, anchors, true))
+                                }
+                            });
+                            Some(step)
+                        }
+                    },
+                )
+                .filter_map(|item| item)
+                .map_err(|(e, _)| e)
             })
             .flatten()
             .fold(url_sink, move |url_sink, link| {
@@ -219,24 +279,18 @@ fn execute_extraction(
 fn main() {
     let store = Arc::new(Store::new());
     let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
-    let find_store = Arc::clone(&store);
     let (task_sink, task_source) = mpsc::channel(20);
     let find_roots = dir_lister(".", Arc::new(|_| true))
         .filter_map(classify_path)
         .map(|entity| future::ok((entity.url(), entity.read_chunks())))
         .buffer_unordered(10)
         .map(move |(url, chunks)| {
-            let store = Arc::clone(&find_store);
-            store
-                .resolve(Arc::clone(&url), HashSet::new())
-                .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
             let (chunk_sink, chunk_source) = mpsc::channel(100);
             let tasks = task_sink.clone();
             tasks
                 .send(ExtractTask {
                     url: Arc::clone(&url),
                     chunk_source,
-                    store,
                 })
                 .map_err(Error::from)
                 .and_then(|_| chunks.map_err(Error::from).forward(chunk_sink).map(|_| ()))
@@ -247,16 +301,18 @@ fn main() {
         .map_err(|e| {
             eprintln!("error: {}", e);
         });
-    let task_executor = execute_extraction(task_source, url_sink);
+    let task_executor = execute_extraction(Arc::clone(&store), task_source, url_sink);
     let consume = url_source
-        .for_each(|url| {
+        .for_each(|_url| {
             //println!("found: {}", url);
             future::ok(())
         })
         .map_err(|_| ());
     let run_both = future::lazy(|| tokio::spawn(consume)).and_then(|_| find_roots);
     tokio::run(run_both);
-    task_executor.join().expect("joining extractor thread failed");
+    task_executor
+        .join()
+        .expect("joining extractor thread failed");
     for (url, found, references) in store.lock().dangling() {
         //let references: Vec<_> = references.iter().map(|u| u.as_str()).collect();
         let reference_count = references.iter().count();
