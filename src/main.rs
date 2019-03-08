@@ -3,13 +3,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::str;
+use std::fmt;
 
 use failure::Error;
 use futures::sink::Sink;
-use futures::{future, stream, Future, Stream};
+use futures::{future, stream, Future, Stream, IntoFuture};
 use html5ever::tokenizer::{
-    BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+    BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult
 };
+use html5ever::Attribute;
+use lazy_static::lazy_static;
+use regex::Regex;
 use structopt::StructOpt;
 use tendril::StrTendril;
 use tokio::fs;
@@ -101,6 +106,36 @@ enum Extracted {
     Anchor(Box<str>),
 }
 
+enum ExtractError {
+    Redirect(Url),
+    Recv(mpsc::error::RecvError),
+    Send(mpsc::error::SendError),
+    Utf8(str::Utf8Error),
+}
+
+impl From<mpsc::error::RecvError> for ExtractError {
+    fn from(recv: mpsc::error::RecvError) -> Self {
+        ExtractError::Recv(recv)
+    }
+}
+
+impl From<mpsc::error::SendError> for ExtractError {
+    fn from(send: mpsc::error::SendError) -> Self {
+        ExtractError::Send(send)
+    }
+}
+
+impl fmt::Display for ExtractError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ExtractError::Redirect(url) => write!(fmt, "redirect to {}", url),
+            ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
+            ExtractError::Send(e) => write!(fmt, "send failure: {}", e),
+            ExtractError::Utf8(e) => write!(fmt, "invalid UTF8: {}", e),
+        }
+    }
+}
+
 // We extract links by feeding chunks of data from a source channel into the
 // `html5ever` tokenizer, which is not `Send`. The reason to use a channel and
 // not an `AsyncRead` instance directly is that we want to use the tokio
@@ -109,25 +144,30 @@ enum Extracted {
 fn extract(
     base: Arc<Url>,
     source: mpsc::Receiver<Vec<u8>>,
-) -> impl Stream<Item = Extracted, Error = Error> {
+) -> impl Stream<Item = Extracted, Error = ExtractError> {
     let queue = BufferQueue::new();
     let tokenizer = Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default());
     iterate(
-        source,
+        source.map_err(ExtractError::Recv),
         (queue, tokenizer),
         |_| (),
         |buf, (mut queue, mut tokenizer)| {
-            let s = match std::str::from_utf8(&buf) {
+            // FIXME: UTF8 parsing may fail at buffer boundaries
+            let s = match str::from_utf8(&buf) {
                 Ok(s) => s,
-                // TODO: don't swallow error here
-                Err(_) => return (Vec::new(), (queue, tokenizer)),
+                Err(e) => return Err(ExtractError::Utf8(e)),
             };
             queue.push_back(StrTendril::from_slice(s));
-            let _ = tokenizer.feed(&mut queue); // TODO: check if ignoring result is OK
-            (tokenizer.sink.output.drain(0..).collect(), (queue, tokenizer))
+            if let TokenizerResult::Script(redirect) = tokenizer.feed(&mut queue) {
+                return Err(ExtractError::Redirect(redirect.0));
+            }
+            Ok((
+                tokenizer.sink.output.drain(0..).collect::<Vec<_>>(),
+                (queue, tokenizer),
+            ))
         },
     )
-    .map(|urls| stream::iter_ok(urls))
+    .map(stream::iter_ok)
     .flatten()
 }
 
@@ -136,14 +176,73 @@ struct ExtractSink {
     output: Vec<Extracted>,
 }
 
+struct Redirect(Url);
+
+lazy_static! {
+    static ref CONTENT_REDIRECT_RE: Regex = Regex::new(r"(?i)^[0-9]+\s*;\s*url=([^;]+)").unwrap();
+}
+
 impl ExtractSink {
     fn new(base: Arc<Url>) -> Self {
-        ExtractSink { base, output: vec![] }
+        ExtractSink {
+            base,
+            output: vec![],
+        }
+    }
+    fn extract_tag(&mut self, name: &str, attrs: &[Attribute]) -> TokenSinkResult<Redirect> {
+        if name == "a" {
+            if let Some(href) = attr_value(attrs, "href").and_then(|value| {
+                self.base
+                    .join(value)
+                    .map_err(|_| {
+                        eprintln!("could not parse URL `{}'", value);
+                    })
+                    .ok()
+            }) {
+                self.output.push(Extracted::Url(href))
+            }
+        } else if name == "meta" {
+            if attrs
+                .iter()
+                .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")
+                .is_some()
+            {
+                if let Some(content) = attr_value(attrs, "content") {
+                    if let Some(url) = CONTENT_REDIRECT_RE
+                        .captures(content)
+                        .and_then(|c| Url::parse(&c[1]).ok())
+                    {
+                        return TokenSinkResult::Script(Redirect(url))
+                    }
+                }
+            }
+        }
+        if let Some(name) = attrs.iter().find_map(|attr| {
+            let name = &attr.name.local;
+            if name == "id" || name == "name" {
+                Some(&attr.value)
+            } else {
+                None
+            }
+        }) {
+            self.output.push(Extracted::Anchor(name.to_string().into()))
+        }
+        TokenSinkResult::Continue
     }
 }
 
+fn attr_value<'a, 'b>(attrs: &'a [Attribute], name: &'b str) -> Option<&'a str> {
+    attrs.iter().find_map(|attr| {
+        if &attr.name.local == name {
+            Some(attr.value.as_ref())
+        } else {
+            None
+        }
+    })
+}
+
 impl TokenSink for ExtractSink {
-    type Handle = Option<Url>;
+    type Handle = Redirect;
 
     fn process_token(&mut self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
         match token {
@@ -152,36 +251,9 @@ impl TokenSink for ExtractSink {
                 ref name,
                 ref attrs,
                 ..
-            }) => {
-                if name == "a" {
-                    if let Some(href) = attrs.iter().find_map(|attr| {
-                        if attr.name.local == *"href" {
-                            self.base.join(&attr.value)
-                                .map_err(|_| {
-                                    eprintln!("could not parse URL `{}'", &attr.value);
-                                })
-                                .ok()
-                        } else {
-                            None
-                        }
-                    }) {
-                        self.output.push(Extracted::Url(href))
-                    }
-                }
-                if let Some(name) = attrs.iter().find_map(|attr| {
-                    let name = &attr.name.local;
-                    if name == "id" || name == "name" {
-                        Some(&attr.value)
-                    } else {
-                        None
-                    }
-                }) {
-                    self.output.push(Extracted::Anchor(name.to_string().into()))
-                }
-            }
-            _ => {}
+            }) => self.extract_tag(name.as_ref(), attrs),
+            _ => TokenSinkResult::Continue,
         }
-        TokenSinkResult::Continue
     }
 }
 
@@ -238,21 +310,23 @@ impl ExtractTask {
         self,
         store: Arc<Store>,
         url_sink: mpsc::Sender<Arc<Url>>,
-    ) -> impl Future<Item = (), Error = Error> {
+    ) -> impl Future<Item = (), Error = ExtractError> {
         let url = self.url;
         let store = Arc::clone(&store);
         let resolve_store = Arc::clone(&store);
         let resolve_url = Arc::clone(&url);
-        let operations = extract(Arc::clone(&url), self.chunk_source).filter_map(move |extracted| match extracted {
-            Extracted::Url(link) => {
-                if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
-                    Some(Operation::SinkUrl(unknown_url))
-                } else {
-                    None
+        let operations = extract(Arc::clone(&url), self.chunk_source).filter_map(
+            move |extracted| match extracted {
+                Extracted::Url(link) => {
+                    if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
+                        Some(Operation::SinkUrl(unknown_url))
+                    } else {
+                        None
+                    }
                 }
-            }
-            Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
-        });
+                Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
+            },
+        );
         iterate(
             operations,
             HashSet::new(),
@@ -264,14 +338,14 @@ impl ExtractTask {
             |op, mut anchors| match op {
                 Operation::AddAnchor(anchor) => {
                     anchors.insert(anchor);
-                    (None, anchors)
+                    Ok((None, anchors))
                 }
-                Operation::SinkUrl(url) => (Some(url), anchors),
+                Operation::SinkUrl(url) => Ok((Some(url), anchors)),
             },
         )
         .filter_map(|item| item)
         .fold(url_sink, move |url_sink, link| {
-            url_sink.send(link).map_err(Error::from)
+            url_sink.send(link)
         })
         .map(|_url_sink| ())
     }
@@ -285,16 +359,17 @@ enum Operation {
 // This is in some ways a mashup between `stream::unfold` and `Stream::fold`. It
 // threads a seed through some computation `step`, and when the stream is
 // exhausted, it calls `finish` on the final seed value.
-fn iterate<S, T, U, F, It>(
+fn iterate<S, T, U, F, Fut, It>(
     stream: S,
     init: T,
     finish: U,
     step: F,
-) -> impl Stream<Item = It, Error = S::Error>
+) -> impl Stream<Item = It, Error = Fut::Error>
 where
-    S: Stream,
+    S: Stream<Error = Fut::Error>,
     U: FnOnce(T) -> (),
-    F: FnMut(S::Item, T) -> (It, T),
+    F: FnMut(S::Item, T) -> Fut,
+    Fut: IntoFuture<Item = (It, T)>,
 {
     let transformed = stream::unfold(
         (stream, init, step, finish, false),
@@ -303,20 +378,20 @@ where
                 finish(seed);
                 None
             } else {
-                let next = s.into_future().map(move |(item, rest)| {
+                let next = s.into_future().map_err(|(e, _)| e).and_then(move |(item, rest)| {
                     if let Some(element) = item {
-                        let (element, seed) = step(element, seed);
-                        (Some(element), (rest, seed, step, finish, false))
+                        future::Either::A(step(element, seed).into_future().map(|(element, seed)| {
+                            (Some(element), (rest, seed, step, finish, false))
+                        }))
                     } else {
-                        (None, (rest, seed, step, finish, true))
+                        future::Either::B(future::ok((None, (rest, seed, step, finish, true))))
                     }
                 });
                 Some(next)
             }
         },
     )
-    .filter_map(|item| item)
-    .map_err(|(e, _)| e);
+    .filter_map(|item| item);
     transformed
 }
 
@@ -327,8 +402,18 @@ fn extraction_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let extract = tasks
-            .map_err(Error::from)
-            .for_each(|task| task.run(Arc::clone(&store), url_sink.clone()));
+            .map_err(ExtractError::Recv)
+            .for_each(|task| {
+                let task_url = Arc::clone(&task.url);
+                task.run(Arc::clone(&store), url_sink.clone()).or_else(move |e| {
+                    match e {
+                        ExtractError::Utf8(e) => eprintln!("could not parse {}: {}", task_url, e),
+                        ExtractError::Redirect(url) => eprintln!("not yet implemented: redirect to {} in {}", url, task_url),
+                        _ => return Err(e),
+                    }
+                    Ok(())
+                })
+            });
         current_thread::block_on_all(extract).unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
         });
@@ -338,11 +423,13 @@ fn extraction_thread(
 #[derive(StructOpt)]
 struct Opt {
     root: PathBuf,
+    #[structopt(long = "filter-links")]
+    link_filter: Option<Regex>,
 }
 
 fn main() {
     let opt = Opt::from_args();
-    let store = Arc::new(Store::new());
+    let store = Arc::new(opt.link_filter.map_or_else(Store::new, Store::with_filter));
     let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
     let (task_sink, task_source) = mpsc::channel(20);
     let find_roots = list_root(opt.root)
@@ -376,9 +463,18 @@ fn main() {
     task_executor
         .join()
         .expect("joining extractor thread failed");
-    for (url, found, references) in store.lock().dangling() {
+    for (url, references) in store.lock().known_dangling() {
         //let references: Vec<_> = references.iter().map(|u| u.as_str()).collect();
-        let reference_count = references.iter().count();
-        println!("URL {} ({}): {} references", url, found, reference_count);
+        //let reference_count = references.count();
+        println!("{}:", url);
+        for (anchor, referrers) in references {
+            match anchor {
+                Some(anchor) => println!("  references to {}", anchor),
+                None => println!("  document references"),
+            }
+            for referrer in referrers {
+                println!("    {}", referrer);
+            }
+        }
     }
 }

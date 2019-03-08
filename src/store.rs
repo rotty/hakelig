@@ -1,7 +1,9 @@
 use std::collections::{hash_map, HashMap, HashSet};
 use std::fmt;
+use std::iter;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use regex::Regex;
 use url::Url;
 
 type AnchorSet = HashSet<Box<str>>;
@@ -42,7 +44,14 @@ impl References {
         (self.anchored, self.plain)
     }
     fn referrers(&self) -> impl Iterator<Item = &Url> {
+        // TODO: uniquify referrers
         self.anchored.values().flatten().map(|r| r.as_ref()).chain(self.plain.iter().map(|r| r.as_ref()))
+    }
+    fn anchored(&self) -> impl Iterator<Item = (&str, impl Iterator<Item = &Url>)> {
+        self.anchored.iter().map(|(a, referrers)| (a.as_ref(), referrers.iter().map(|r| r.as_ref())))
+    }
+    fn plain(&self) -> impl Iterator<Item = &Url> {
+        self.plain.iter().map(|u| u.as_ref())
     }
 }
 
@@ -86,6 +95,7 @@ pub struct Store(Mutex<StoreInner>);
 
 #[derive(Default)]
 struct StoreInner {
+    link_filter: Option<Regex>,
     // State of these links is unknown, they get moved to `documents` on
     // `resolve`.
     unknown: HashMap<Arc<Url>, References>,
@@ -108,6 +118,13 @@ impl Store {
     pub fn new() -> Self {
         Store::default()
     }
+    pub fn with_filter(filter: Regex) -> Self {
+        Store(Mutex::new(StoreInner {
+            link_filter: Some(filter),
+            unknown: Default::default(),
+            documents: Default::default(),
+        }))
+    }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
         use hash_map::Entry;
         let mut guard = self.0.lock().expect("store mutex poisoned");
@@ -125,6 +142,12 @@ impl Store {
         Ok(())
     }
     pub fn add_link(&self, url: Arc<Url>, referrer: Arc<Url>) -> Option<Arc<Url>> {
+        let mut guard = self.0.lock().expect("store mutex poisoned");
+        if let Some(ref filter) = guard.link_filter {
+            if filter.is_match(url.as_str()) {
+                return None;
+            }
+        }
         let (url, fragment) = match url.fragment() {
             Some(fragment) => {
                 let mut url = (*url).clone();
@@ -133,7 +156,6 @@ impl Store {
             }
             None => (Arc::clone(&url), None),
         };
-        let mut guard = self.0.lock().expect("store mutex poisoned");
         if let Some(doc) = guard.documents.get_mut(&url) {
             doc.add_referrer(fragment.map(Into::into), referrer);
             None
@@ -161,6 +183,9 @@ impl<'a> LockedStore<'a> {
             .map(unknown_dangling)
             .chain(self.0.documents.iter().filter_map(document_dangling))
     }
+    pub fn known_dangling(&'a self) -> impl Iterator<Item = (&'a Url, impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>)> {
+        self.0.documents.iter().filter_map(document_known_dangling)
+    }
 }
 
 fn unknown_dangling<'a>(
@@ -178,5 +203,18 @@ fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Optio
         None
     } else {
         Some((&url, true, document.unresolved.referrers().collect()))
+    }
+}
+
+fn document_known_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Option<(&'a Url, impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>)> {
+    if document.unresolved.is_empty() {
+        None
+    } else {
+        let none: Option<&'a str> = None;
+        let plain = iter::once((none, document.unresolved.plain().collect()));
+        let anchored = document.unresolved.anchored().map(|(anchor, referrers)| {
+            (Some(anchor), referrers.collect())
+        });
+        Some((&url, plain.chain(anchored)))
     }
 }
