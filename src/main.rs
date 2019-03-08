@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -10,11 +10,13 @@ use futures::{future, stream, Future, Stream};
 use html5ever::tokenizer::{
     BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
+use structopt::StructOpt;
 use tendril::StrTendril;
 use tokio::fs;
 use tokio::runtime::current_thread;
 use tokio::sync::mpsc;
 use url::Url;
+
 mod store;
 
 use store::Store;
@@ -44,6 +46,32 @@ where
             .flatten_stream()
     });
     Box::new(entries.flatten())
+}
+
+type EntityStream = Box<dyn Stream<Item = Box<dyn Entity>, Error = Error> + Send>;
+
+fn list_root<P>(path: P) -> EntityStream
+where
+    P: AsRef<Path> + Send + Sync + 'static,
+{
+    let inner_path = path.as_ref().to_owned();
+    let stream = fs::metadata(path)
+        .map(|metadata| {
+            let path = inner_path;
+            if metadata.file_type().is_dir() {
+                Box::new(
+                    dir_lister(path, Arc::new(|_| true))
+                        .filter_map(|p| classify_path(&p))
+                        .map_err(Error::from),
+                ) as EntityStream
+            } else {
+                Box::new(stream::once(Ok(path)).filter_map(|p| classify_path(p.as_ref())))
+                    as EntityStream
+            }
+        })
+        .map_err(Error::from)
+        .flatten_stream();
+    Box::new(stream)
 }
 
 trait Entity {
@@ -78,9 +106,12 @@ enum Extracted {
 // not an `AsyncRead` instance directly is that we want to use the tokio
 // threadpool runtime for the actual reading, so we can handle blocking disk
 // I/O, but cannot run the tokenizer inside the thread pool.
-fn extract(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Extracted, Error = Error> {
+fn extract(
+    base: Arc<Url>,
+    source: mpsc::Receiver<Vec<u8>>,
+) -> impl Stream<Item = Extracted, Error = Error> {
     let queue = BufferQueue::new();
-    let tokenizer = Tokenizer::new(ExtractSink::default(), TokenizerOpts::default());
+    let tokenizer = Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default());
     iterate(
         source,
         (queue, tokenizer),
@@ -93,15 +124,23 @@ fn extract(source: mpsc::Receiver<Vec<u8>>) -> impl Stream<Item = Extracted, Err
             };
             queue.push_back(StrTendril::from_slice(s));
             let _ = tokenizer.feed(&mut queue); // TODO: check if ignoring result is OK
-            (tokenizer.sink.0.drain(0..).collect(), (queue, tokenizer))
+            (tokenizer.sink.output.drain(0..).collect(), (queue, tokenizer))
         },
     )
     .map(|urls| stream::iter_ok(urls))
     .flatten()
 }
 
-#[derive(Default)]
-struct ExtractSink(Vec<Extracted>);
+struct ExtractSink {
+    base: Arc<Url>,
+    output: Vec<Extracted>,
+}
+
+impl ExtractSink {
+    fn new(base: Arc<Url>) -> Self {
+        ExtractSink { base, output: vec![] }
+    }
+}
 
 impl TokenSink for ExtractSink {
     type Handle = Option<Url>;
@@ -117,12 +156,16 @@ impl TokenSink for ExtractSink {
                 if name == "a" {
                     if let Some(href) = attrs.iter().find_map(|attr| {
                         if attr.name.local == *"href" {
-                            Url::parse(&attr.value).ok()
+                            self.base.join(&attr.value)
+                                .map_err(|_| {
+                                    eprintln!("could not parse URL `{}'", &attr.value);
+                                })
+                                .ok()
                         } else {
                             None
                         }
                     }) {
-                        self.0.push(Extracted::Url(href))
+                        self.output.push(Extracted::Url(href))
                     }
                 }
                 if let Some(name) = attrs.iter().find_map(|attr| {
@@ -133,7 +176,7 @@ impl TokenSink for ExtractSink {
                         None
                     }
                 }) {
-                    self.0.push(Extracted::Anchor(name.to_string().into()))
+                    self.output.push(Extracted::Anchor(name.to_string().into()))
                 }
             }
             _ => {}
@@ -170,7 +213,7 @@ impl Entity for HtmlPath {
     }
 }
 
-fn classify_path(path: Box<Path>) -> Option<Box<dyn Entity>> {
+fn classify_path(path: &Path) -> Option<Box<dyn Entity>> {
     path.extension()
         .and_then(|ext| ext.to_str())
         .and_then(|ext| match ext {
@@ -200,7 +243,7 @@ impl ExtractTask {
         let store = Arc::clone(&store);
         let resolve_store = Arc::clone(&store);
         let resolve_url = Arc::clone(&url);
-        let operations = extract(self.chunk_source).filter_map(move |extracted| match extracted {
+        let operations = extract(Arc::clone(&url), self.chunk_source).filter_map(move |extracted| match extracted {
             Extracted::Url(link) => {
                 if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
                     Some(Operation::SinkUrl(unknown_url))
@@ -292,12 +335,17 @@ fn extraction_thread(
     })
 }
 
+#[derive(StructOpt)]
+struct Opt {
+    root: PathBuf,
+}
+
 fn main() {
+    let opt = Opt::from_args();
     let store = Arc::new(Store::new());
     let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
     let (task_sink, task_source) = mpsc::channel(20);
-    let find_roots = dir_lister(".", Arc::new(|_| true))
-        .filter_map(classify_path)
+    let find_roots = list_root(opt.root)
         .map(|entity| future::ok((entity.url(), entity.read_chunks())))
         .buffer_unordered(10)
         .map(move |(url, chunks)| {
@@ -311,7 +359,6 @@ fn main() {
                 .map_err(Error::from)
                 .and_then(|_| chunks.map_err(Error::from).forward(chunk_sink).map(|_| ()))
         })
-        .map_err(Error::from)
         .buffer_unordered(10)
         .for_each(|_| future::ok(()))
         .map_err(|e| {
