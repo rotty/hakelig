@@ -3,7 +3,7 @@ use std::fmt;
 use std::iter;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use regex::Regex;
+use regex::RegexSet;
 use url::Url;
 
 type AnchorSet = HashSet<Box<str>>;
@@ -90,12 +90,10 @@ impl Document {
     }
 }
 
-#[derive(Default)]
 pub struct Store(Mutex<StoreInner>);
 
-#[derive(Default)]
 struct StoreInner {
-    link_filter: Option<Regex>,
+    link_ignore: RegexSet,
     // State of these links is unknown, they get moved to `documents` on
     // `resolve`.
     unknown: HashMap<Arc<Url>, References>,
@@ -117,12 +115,9 @@ impl fmt::Display for Error {
 }
 
 impl Store {
-    pub fn new() -> Self {
-        Store::default()
-    }
-    pub fn with_filter(filter: Regex) -> Self {
+    pub fn new(link_ignore: RegexSet) -> Self {
         Store(Mutex::new(StoreInner {
-            link_filter: Some(filter),
+            link_ignore: link_ignore,
             unknown: Default::default(),
             documents: Default::default(),
             redirects: Default::default(),
@@ -146,18 +141,16 @@ impl Store {
     }
     pub fn add_link(&self, url: Arc<Url>, referrer: Arc<Url>) -> Option<Arc<Url>> {
         let mut guard = self.0.lock().expect("store mutex poisoned");
-        if let Some(ref filter) = guard.link_filter {
-            if filter.is_match(url.as_str()) {
-                return None;
-            }
+        if guard.link_ignore.is_match(url.as_str()) {
+            return None;
         }
         let (url, fragment) = match url.fragment() {
-            Some(fragment) => {
+            Some(fragment) if !fragment.is_empty() => {
                 let mut url = (*url).clone();
                 url.set_fragment(None);
                 (Arc::new(url), Some(fragment))
             }
-            None => (Arc::clone(&url), None),
+            _ => (Arc::clone(&url), None),
         };
         let url = Arc::clone(guard.redirects.get(&url).unwrap_or(&url));
         if let Some(doc) = guard.documents.get_mut(&url) {

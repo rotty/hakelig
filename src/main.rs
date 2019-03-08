@@ -11,7 +11,7 @@ use structopt::StructOpt;
 use tokio::fs;
 use tokio::sync::mpsc;
 use url::Url;
-use regex::Regex;
+use regex::RegexSet;
 
 mod extract;
 mod store;
@@ -140,13 +140,14 @@ fn classify_path(path: &Path) -> Option<Box<dyn Entity>> {
 #[derive(StructOpt)]
 struct Opt {
     root: PathBuf,
-    #[structopt(long = "filter-links")]
-    link_filter: Option<Regex>,
+    #[structopt(long = "link-ignore")]
+    link_ignore: Vec<String>,
 }
 
-fn main() {
+fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
-    let store = Arc::new(opt.link_filter.map_or_else(Store::new, Store::with_filter));
+    let link_ignore_set = RegexSet::new(opt.link_ignore)?;
+    let store = Arc::new(Store::new(link_ignore_set));
     let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
     let (task_sink, task_source) = mpsc::channel(20);
     let find_roots = list_root(opt.root)
@@ -191,4 +192,5 @@ fn main() {
             }
         }
     }
+    Ok(())
 }
