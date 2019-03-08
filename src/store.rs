@@ -101,6 +101,8 @@ struct StoreInner {
     unknown: HashMap<Arc<Url>, References>,
     // Visited documents, indexed by URL.
     documents: HashMap<Arc<Url>, Document>,
+    // Redirected URLs
+    redirects: HashMap<Arc<Url>, Arc<Url>>,
 }
 
 #[derive(Debug)]
@@ -123,6 +125,7 @@ impl Store {
             link_filter: Some(filter),
             unknown: Default::default(),
             documents: Default::default(),
+            redirects: Default::default(),
         }))
     }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
@@ -156,6 +159,7 @@ impl Store {
             }
             None => (Arc::clone(&url), None),
         };
+        let url = Arc::clone(guard.redirects.get(&url).unwrap_or(&url));
         if let Some(doc) = guard.documents.get_mut(&url) {
             doc.add_referrer(fragment.map(Into::into), referrer);
             None
@@ -167,6 +171,10 @@ impl Store {
                 .add(fragment.map(Into::into), referrer);
             Some(url)
         }
+    }
+    pub fn add_redirect(&self, url: Arc<Url>, to: Arc<Url>) {
+        let mut guard = self.0.lock().expect("store mutex poisoned");
+        guard.redirects.insert(url, to);
     }
     pub fn lock(&self) -> LockedStore {
         LockedStore(self.0.lock().expect("mutex poisoned"))

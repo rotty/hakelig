@@ -1,16 +1,18 @@
+#![type_length_limit = "2097152"]
+
 use std::collections::HashSet;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str;
 use std::sync::Arc;
 use std::thread;
-use std::str;
-use std::fmt;
 
 use failure::Error;
 use futures::sink::Sink;
-use futures::{future, stream, Future, Stream, IntoFuture};
+use futures::{future, stream, Future, IntoFuture, Stream};
 use html5ever::tokenizer::{
-    BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult
+    BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult,
 };
 use html5ever::Attribute;
 use lazy_static::lazy_static;
@@ -125,6 +127,12 @@ impl From<mpsc::error::SendError> for ExtractError {
     }
 }
 
+impl From<str::Utf8Error> for ExtractError {
+    fn from(e: str::Utf8Error) -> Self {
+        ExtractError::Utf8(e)
+    }
+}
+
 impl fmt::Display for ExtractError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -132,6 +140,21 @@ impl fmt::Display for ExtractError {
             ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
             ExtractError::Send(e) => write!(fmt, "send failure: {}", e),
             ExtractError::Utf8(e) => write!(fmt, "invalid UTF8: {}", e),
+        }
+    }
+}
+
+fn from_utf8_partial(input: &[u8]) -> Result<(&str, &[u8]), str::Utf8Error> {
+    match str::from_utf8(input) {
+        Ok(s) => Ok((s, &[])),
+        Err(e) => {
+            let error_idx = e.valid_up_to();
+            if error_idx == 0 {
+                return Err(e);
+            }
+            let (valid, after_valid) = input.split_at(error_idx);
+            let s = unsafe { str::from_utf8_unchecked(valid) };
+            Ok((s, after_valid))
         }
     }
 }
@@ -149,13 +172,15 @@ fn extract(
     let tokenizer = Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default());
     iterate(
         source.map_err(ExtractError::Recv),
-        (queue, tokenizer),
+        (queue, tokenizer, vec![]),
         |_| (),
-        |buf, (mut queue, mut tokenizer)| {
-            // FIXME: UTF8 parsing may fail at buffer boundaries
-            let s = match str::from_utf8(&buf) {
-                Ok(s) => s,
-                Err(e) => return Err(ExtractError::Utf8(e)),
+        |buf, (mut queue, mut tokenizer, mut remainder)| {
+            // FIXME: UTF8 parsing may fail inadvertently at buffer boundaries
+            let (s, remainder) = if remainder.len() == 0 {
+                from_utf8_partial(&buf)?
+            } else {
+                remainder.extend(&buf);
+                from_utf8_partial(&remainder)?
             };
             queue.push_back(StrTendril::from_slice(s));
             if let TokenizerResult::Script(redirect) = tokenizer.feed(&mut queue) {
@@ -163,7 +188,7 @@ fn extract(
             }
             Ok((
                 tokenizer.sink.output.drain(0..).collect::<Vec<_>>(),
-                (queue, tokenizer),
+                (queue, tokenizer, Vec::from(remainder)),
             ))
         },
     )
@@ -179,7 +204,7 @@ struct ExtractSink {
 struct Redirect(Url);
 
 lazy_static! {
-    static ref CONTENT_REDIRECT_RE: Regex = Regex::new(r"(?i)^[0-9]+\s*;\s*url=([^;]+)").unwrap();
+    static ref CONTENT_REDIRECT_RE: Regex = Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap();
 }
 
 impl ExtractSink {
@@ -210,9 +235,9 @@ impl ExtractSink {
                 if let Some(content) = attr_value(attrs, "content") {
                     if let Some(url) = CONTENT_REDIRECT_RE
                         .captures(content)
-                        .and_then(|c| Url::parse(&c[1]).ok())
+                        .and_then(|c| self.base.join(&c[1]).ok())
                     {
-                        return TokenSinkResult::Script(Redirect(url))
+                        return TokenSinkResult::Script(Redirect(url));
                     }
                 }
             }
@@ -344,9 +369,7 @@ impl ExtractTask {
             },
         )
         .filter_map(|item| item)
-        .fold(url_sink, move |url_sink, link| {
-            url_sink.send(link)
-        })
+        .fold(url_sink, move |url_sink, link| url_sink.send(link))
         .map(|_url_sink| ())
     }
 }
@@ -378,15 +401,20 @@ where
                 finish(seed);
                 None
             } else {
-                let next = s.into_future().map_err(|(e, _)| e).and_then(move |(item, rest)| {
-                    if let Some(element) = item {
-                        future::Either::A(step(element, seed).into_future().map(|(element, seed)| {
-                            (Some(element), (rest, seed, step, finish, false))
-                        }))
-                    } else {
-                        future::Either::B(future::ok((None, (rest, seed, step, finish, true))))
-                    }
-                });
+                let next = s
+                    .into_future()
+                    .map_err(|(e, _)| e)
+                    .and_then(move |(item, rest)| {
+                        if let Some(element) = item {
+                            future::Either::A(step(element, seed).into_future().map(
+                                |(element, seed)| {
+                                    (Some(element), (rest, seed, step, finish, false))
+                                },
+                            ))
+                        } else {
+                            future::Either::B(future::ok((None, (rest, seed, step, finish, true))))
+                        }
+                    });
                 Some(next)
             }
         },
@@ -401,19 +429,21 @@ fn extraction_thread(
     url_sink: mpsc::Sender<Arc<Url>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let extract = tasks
-            .map_err(ExtractError::Recv)
-            .for_each(|task| {
-                let task_url = Arc::clone(&task.url);
-                task.run(Arc::clone(&store), url_sink.clone()).or_else(move |e| {
+        let extract = tasks.map_err(ExtractError::Recv).for_each(|task| {
+            let task_url = Arc::clone(&task.url);
+            let store = Arc::clone(&store);
+            task.run(Arc::clone(&store), url_sink.clone())
+                .or_else(move |e| {
                     match e {
                         ExtractError::Utf8(e) => eprintln!("could not parse {}: {}", task_url, e),
-                        ExtractError::Redirect(url) => eprintln!("not yet implemented: redirect to {} in {}", url, task_url),
+                        ExtractError::Redirect(url) => {
+                            store.add_redirect(task_url, Arc::new(url));
+                        }
                         _ => return Err(e),
                     }
                     Ok(())
                 })
-            });
+        });
         current_thread::block_on_all(extract).unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
         });
