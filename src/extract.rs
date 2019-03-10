@@ -134,6 +134,23 @@ lazy_static! {
     static ref CONTENT_REDIRECT_RE: Regex = Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap();
 }
 
+/// Checks for a `http-equiv=refresh` attribute and returns the URL inside the
+/// `content` attribute, if present.
+fn meta_refresh_url(attrs: &[Attribute]) -> Option<&str> {
+    if attrs
+        .iter()
+        .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")
+        .is_none()
+    {
+        return None;
+    }
+    attr_value(attrs, "content").and_then(|content| {
+        CONTENT_REDIRECT_RE
+            .captures(content)
+            .map(|c| c.get(1).unwrap().as_str())
+    })
+}
+
 impl ExtractSink {
     fn new(base: Arc<Url>) -> Self {
         ExtractSink {
@@ -147,19 +164,8 @@ impl ExtractSink {
                 self.output.push(Extracted::Link(href.into()))
             }
         } else if name == "meta" {
-            if attrs
-                .iter()
-                .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")
-                .is_some()
-            {
-                if let Some(content) = attr_value(attrs, "content") {
-                    if let Some(url) = CONTENT_REDIRECT_RE
-                        .captures(content)
-                        .and_then(|c| self.base.join(&c[1]).ok())
-                    {
-                        return TokenSinkResult::Script(Redirect(url));
-                    }
-                }
+            if let Some(url) = meta_refresh_url(attrs).and_then(|url| self.base.join(url).ok()) {
+                return TokenSinkResult::Script(Redirect(url));
             }
         }
         if let Some(name) = attrs.iter().find_map(|attr| {

@@ -144,7 +144,7 @@ impl fmt::Display for Error {
 impl Store {
     pub fn new(link_ignore: RegexSet) -> Self {
         Store(Mutex::new(StoreInner {
-            link_ignore: link_ignore,
+            link_ignore,
             unknown: Default::default(),
             documents: Default::default(),
             redirects: Default::default(),
