@@ -274,7 +274,6 @@ impl ExtractTask {
                 future::Either::B(process_url(url, chunk_source, store, url_sink, state))
             }
         }
-        //dbg!(&self.url);
     }
 }
 
@@ -288,9 +287,8 @@ fn process_url(
     queue_state.extraction_dequeued();
     let store = Arc::clone(&url_store);
     let url = Arc::clone(&task_url);
-    let operations = extract(Arc::clone(&url), chunk_source).filter_map(move |extracted| {
-        //dbg!(&extracted);
-        match extracted {
+    let operations =
+        extract(Arc::clone(&url), chunk_source).filter_map(move |extracted| match extracted {
             Extracted::Link(link) => {
                 if let Some(unknown_url) = store.add_link(Arc::clone(&url), link) {
                     Some(Operation::SinkUrl(unknown_url))
@@ -299,8 +297,7 @@ fn process_url(
                 }
             }
             Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
-        }
-    });
+        });
     let url = Arc::clone(&task_url);
     let store = Arc::clone(&url_store);
     let found_urls = iterate(
@@ -311,15 +308,12 @@ fn process_url(
                 .resolve(Arc::clone(&url), anchors)
                 .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
         },
-        |op, mut anchors| {
-            //dbg!(&op);
-            match op {
-                Operation::AddAnchor(anchor) => {
-                    anchors.insert(anchor);
-                    Ok((None, anchors))
-                }
-                Operation::SinkUrl(url) => Ok((Some(url), anchors)),
+        |op, mut anchors| match op {
+            Operation::AddAnchor(anchor) => {
+                anchors.insert(anchor);
+                Ok((None, anchors))
             }
+            Operation::SinkUrl(url) => Ok((Some(url), anchors)),
         },
     )
     .filter_map(|item| item);

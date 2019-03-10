@@ -167,7 +167,6 @@ impl Store {
         }))
     }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
-        //dbg!(("RESOLVE", &url));
         use hash_map::Entry;
         let mut guard = self.0.lock().expect("store mutex poisoned");
         let references = guard.unknown.remove(&url);
@@ -196,7 +195,6 @@ impl Store {
                 eprintln!("could not parse link `{}'", href);
             })
             .ok()?;
-        //dbg!(&url);
         let mut guard = self.0.lock().expect("store mutex poisoned");
         if guard.link_ignore.is_match(target.as_str()) {
             return None;
@@ -226,7 +224,6 @@ impl Store {
                 .entry(Arc::clone(&url))
                 .or_insert_with(References::default)
                 .add(fragment.map(Into::into), referrer);
-            //dbg!(&url);
             Some(url)
         }
     }
