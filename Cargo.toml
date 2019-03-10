@@ -2,6 +2,10 @@
 name = "hakelig"
 version = "0.0.1"
 authors = ["Andreas Rottmann <mail@r0tty.org>"]
+license = "GPL-2.0-or-later"
+repository = "https://r0tty.org/git/rust/hakelig"
+keywords = ["link", "checker", "html"]
+categories = ["command-line-utilities"]
 edition = "2018"
 
 [dependencies]
