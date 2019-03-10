@@ -276,51 +276,68 @@ fn main() -> Result<(), Error> {
     let link_ignore_set = RegexSet::new(opt.link_ignore)?;
     let store = Arc::new(Store::new(link_ignore_set));
     let (found_sink, found_source) = mpsc::unbounded_channel();
-    let (task_sink, task_source) = mpsc::channel(1);
+    let (task_sink, task_source) = mpsc::channel(10);
     let state = QueueState::new();
     let root_enqueue_state = state.clone();
     let roots = list_root(opt.root).map(move |entity| {
         root_enqueue_state.url_enqueued();
         entity
     });
-    let root_submit_state = state.clone();
-    let submit_roots = submit_entities(roots, task_sink.clone(), Arc::clone(&store), state.clone()).map_err(|e| {
-        eprintln!("could not pass root stream to extractor: {}", e);
-    }).then(move |result| {
-        debug!("submitting roots done");
-        root_submit_state.roots_done();
-        result
-    });
-    let task_executor = extraction_thread(Arc::clone(&store), task_source, found_sink, state.clone());
-    let found_state = state.clone();
-    let found_entities = found_source
-        .map_err(Error::from)
-        .filter_map(move |url| match classify_url(&url) {
-            None => { found_state.url_dequeued(); None }
-            Some(entity) => Some(entity),
-        });
-    let process_found_urls = submit_entities(found_entities, task_sink, Arc::clone(&store), state.clone())
+    let roots_done_state = state.clone();
+    let sentinel_sink = task_sink.clone();
+    let submit_roots = submit_entities(roots, task_sink.clone(), Arc::clone(&store), state.clone())
         .map_err(|e| {
-            eprintln!("error processing found URLs: {}", e);
-        }).then(|result| {
-            debug!("processing new URLs is done");
-            result
+            eprintln!("could not pass root stream to extractor: {}", e);
+        })
+        .then(move |_| {
+            roots_done_state.roots_done();
+            debug!("submitting roots done: {:?}", roots_done_state);
+            sentinel_sink
+                .send(ExtractTask::sentinel())
+                .map_err(|e| {
+                    eprintln!("could not send root sentinel: {}", e);
+                })
+                .map(|_| ())
         });
-    let queue_state_printer = timer::Interval::new_interval(Duration::from_millis(10)).map_err(|e| {
-        eprintln!("timer for queue state printer failed: {}", e);
-    }).for_each(move |_instant| {
-        eprintln!("queue state: {:?}", state);
-        if state.is_done() {
-            return Err(());
-        }
-        Ok(())
-    });
+    let task_executor =
+        extraction_thread(Arc::clone(&store), task_source, found_sink, state.clone());
+    let found_state = state.clone();
+    let found_entities =
+        found_source
+            .map_err(Error::from)
+            .filter_map(move |url| match classify_url(&url) {
+                None => {
+                    found_state.url_dequeued();
+                    None
+                }
+                Some(entity) => Some(entity),
+            });
+    let process_extracted_urls =
+        submit_entities(found_entities, task_sink, Arc::clone(&store), state.clone())
+            .map_err(|e| {
+                eprintln!("error processing found URLs: {}", e);
+            })
+            .then(|result| {
+                debug!("processing new URLs is done");
+                result
+            });
+    let queue_state_printer = timer::Interval::new_interval(Duration::from_millis(100))
+        .map_err(|e| {
+            eprintln!("timer for queue state printer failed: {}", e);
+        })
+        .for_each(move |_instant| {
+            eprintln!("queue state: {:?}", state);
+            if state.is_done() {
+                return Err(());
+            }
+            Ok(())
+        });
     let run = future::lazy(|| {
-        tokio::spawn(queue_state_printer);
-        tokio::spawn(process_found_urls)
-    }).and_then(|_| submit_roots);
+        tokio::spawn(submit_roots);
+        tokio::spawn(queue_state_printer)
+    })
+    .and_then(|_| process_extracted_urls);
     tokio::run(run);
-    dbg!("DONE");
     task_executor
         .join()
         .expect("joining extractor thread failed");

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::{hash_map, HashMap, HashSet};
 use std::fmt;
 use std::iter;
@@ -45,10 +47,16 @@ impl References {
     }
     fn referrers(&self) -> impl Iterator<Item = &Url> {
         // TODO: uniquify referrers
-        self.anchored.values().flatten().map(|r| r.as_ref()).chain(self.plain.iter().map(|r| r.as_ref()))
+        self.anchored
+            .values()
+            .flatten()
+            .map(|r| r.as_ref())
+            .chain(self.plain.iter().map(|r| r.as_ref()))
     }
     fn anchored(&self) -> impl Iterator<Item = (&str, impl Iterator<Item = &Url>)> {
-        self.anchored.iter().map(|(a, referrers)| (a.as_ref(), referrers.iter().map(|r| r.as_ref())))
+        self.anchored
+            .iter()
+            .map(|(a, referrers)| (a.as_ref(), referrers.iter().map(|r| r.as_ref())))
     }
     fn plain(&self) -> impl Iterator<Item = &Url> {
         self.plain.iter().map(|u| u.as_ref())
@@ -201,7 +209,14 @@ impl<'a> LockedStore<'a> {
             .map(unknown_dangling)
             .chain(self.0.documents.iter().filter_map(document_dangling))
     }
-    pub fn known_dangling(&'a self) -> impl Iterator<Item = (&'a Url, impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>)> {
+    pub fn known_dangling(
+        &'a self,
+    ) -> impl Iterator<
+        Item = (
+            &'a Url,
+            impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>,
+        ),
+    > {
         self.0.documents.iter().filter_map(document_known_dangling)
     }
 }
@@ -209,14 +224,12 @@ impl<'a> LockedStore<'a> {
 fn unknown_dangling<'a>(
     (url, references): (&'a Arc<Url>, &'a References),
 ) -> (&'a Url, bool, Vec<&'a Url>) {
-    (
-        &url,
-        false,
-        references.referrers().collect()
-    )
+    (&url, false, references.referrers().collect())
 }
 
-fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Option<(&'a Url, bool, Vec<&'a Url>)> {
+fn document_dangling<'a>(
+    (url, document): (&'a Arc<Url>, &'a Document),
+) -> Option<(&'a Url, bool, Vec<&'a Url>)> {
     if document.unresolved.is_empty() {
         None
     } else {
@@ -224,15 +237,21 @@ fn document_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Optio
     }
 }
 
-fn document_known_dangling<'a>((url, document): (&'a Arc<Url>, &'a Document)) -> Option<(&'a Url, impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>)> {
+fn document_known_dangling<'a>(
+    (url, document): (&'a Arc<Url>, &'a Document),
+) -> Option<(
+    &'a Url,
+    impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>,
+)> {
     if document.unresolved.is_empty() {
         None
     } else {
         let none: Option<&'a str> = None;
         let plain = iter::once((none, document.unresolved.plain().collect()));
-        let anchored = document.unresolved.anchored().map(|(anchor, referrers)| {
-            (Some(anchor), referrers.collect())
-        });
+        let anchored = document
+            .unresolved
+            .anchored()
+            .map(|(anchor, referrers)| (Some(anchor), referrers.collect()));
         Some((&url, plain.chain(anchored)))
     }
 }

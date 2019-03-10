@@ -10,12 +10,12 @@ use html5ever::tokenizer::{
 };
 use html5ever::Attribute;
 use lazy_static::lazy_static;
+use log::debug;
 use regex::Regex;
 use tendril::StrTendril;
 use tokio::runtime::current_thread;
 use tokio::sync::mpsc;
 use url::Url;
-use log::debug;
 
 use crate::store::Store;
 
@@ -216,29 +216,11 @@ pub fn extraction_thread(
     state: super::QueueState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let extract = tasks.map_err(ExtractError::Recv).for_each(|task| {
-            state.extraction_dequeued();
-            let task_url = Arc::clone(&task.url);
-            let store = Arc::clone(&store);
-            task.run(Arc::clone(&store), url_sink.clone(), state.clone())
-                .then(|result| {
-                    state.extraction_done();
-                    if state.is_done() {
-                        return Err(ExtractError::Finished)
-                    }
-                    result
-                })
-                .or_else(move |e| {
-                    match e {
-                        ExtractError::Utf8(e) => eprintln!("could not parse {}: {}", task_url, e),
-                        ExtractError::Redirect(url) => {
-                            store.add_redirect(task_url, Arc::new(url));
-                        }
-                        _ => return Err(e),
-                    }
-                    Ok(())
-                })
-        });
+        let extract = tasks
+            .map_err(ExtractError::Recv)
+            .map(move |task| task.run(Arc::clone(&store), url_sink.clone(), state.clone()))
+            .buffer_unordered(10)
+            .for_each(|_| Ok(()));
         current_thread::block_on_all(extract).unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
         });
@@ -246,14 +228,22 @@ pub fn extraction_thread(
     })
 }
 
-pub struct ExtractTask {
-    url: Arc<Url>,
-    chunk_source: mpsc::Receiver<Vec<u8>>,
+pub struct ExtractTask(TaskInner);
+
+enum TaskInner {
+    Sentinel,
+    Process {
+        url: Arc<Url>,
+        chunk_source: mpsc::Receiver<Vec<u8>>,
+    },
 }
 
 impl ExtractTask {
     pub fn new(url: Arc<Url>, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
-        ExtractTask { url, chunk_source }
+        ExtractTask(TaskInner::Process { url, chunk_source })
+    }
+    pub fn sentinel() -> Self {
+        ExtractTask(TaskInner::Sentinel)
     }
     fn run(
         self,
@@ -261,58 +251,101 @@ impl ExtractTask {
         url_sink: mpsc::UnboundedSender<Arc<Url>>,
         state: super::QueueState,
     ) -> impl Future<Item = (), Error = ExtractError> {
+        match self.0 {
+            TaskInner::Sentinel => {
+                let process_sentinel = future::lazy(move || {
+                    if state.is_done() {
+                        return Err(ExtractError::Finished);
+                    }
+                    Ok(())
+                });
+                future::Either::A(process_sentinel)
+            }
+            TaskInner::Process { url, chunk_source } => {
+                future::Either::B(process_url(url, chunk_source, store, url_sink, state))
+            }
+        }
         //dbg!(&self.url);
-        let task_url = self.url;
-        let store = Arc::clone(&store);
-        let resolve_store = Arc::clone(&store);
-        let url = Arc::clone(&task_url);
-        let operations = extract(Arc::clone(&url), self.chunk_source).filter_map(
-            move |extracted| {
-                //dbg!(&extracted);
-                match extracted {
-                    Extracted::Url(link) => {
-                        if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
-                            Some(Operation::SinkUrl(unknown_url))
-                        } else {
-                            None
-                        }
-                    }
-                    Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
-                }
-            });
-        let url = Arc::clone(&task_url);
-        let found_urls = iterate(
-            operations,
-            HashSet::new(),
-            move |anchors| {
-                resolve_store
-                    .resolve(Arc::clone(&url), anchors)
-                    .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
-            },
-            |op, mut anchors| {
-                //dbg!(&op);
-                match op {
-                    Operation::AddAnchor(anchor) => {
-                        anchors.insert(anchor);
-                        Ok((None, anchors))
-                    }
-                    Operation::SinkUrl(url) => Ok((Some(url), anchors)),
+    }
+}
+
+fn process_url(
+    task_url: Arc<Url>,
+    chunk_source: mpsc::Receiver<Vec<u8>>,
+    url_store: Arc<Store>,
+    url_sink: mpsc::UnboundedSender<Arc<Url>>,
+    queue_state: super::QueueState,
+) -> impl Future<Item = (), Error = ExtractError> {
+    queue_state.extraction_dequeued();
+    let store = Arc::clone(&url_store);
+    let url = Arc::clone(&task_url);
+    let operations = extract(Arc::clone(&url), chunk_source).filter_map(move |extracted| {
+        //dbg!(&extracted);
+        match extracted {
+            Extracted::Url(link) => {
+                if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
+                    Some(Operation::SinkUrl(unknown_url))
+                } else {
+                    None
                 }
             }
-        ).filter_map(|item| item);
+            Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
+        }
+    });
+    let url = Arc::clone(&task_url);
+    let store = Arc::clone(&url_store);
+    let found_urls = iterate(
+        operations,
+        HashSet::new(),
+        move |anchors| {
+            store
+                .resolve(Arc::clone(&url), anchors)
+                .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
+        },
+        |op, mut anchors| {
+            //dbg!(&op);
+            match op {
+                Operation::AddAnchor(anchor) => {
+                    anchors.insert(anchor);
+                    Ok((None, anchors))
+                }
+                Operation::SinkUrl(url) => Ok((Some(url), anchors)),
+            }
+        },
+    )
+    .filter_map(|item| item);
 
-        let url = Arc::clone(&task_url);
-        let found_debug = found_urls.map(move |item| {
-            debug!("submitting URL {}, extracted from {}", &item, &url);
-            state.url_enqueued(); // TODO: is this really _sure_?
-            item
-        });
-        let url = Arc::clone(&task_url);
-        found_debug.forward(url_sink)
-            .map(move |_url_sink| {
-                debug!("done running extraction for {}", &url);
-            })
-    }
+    let url = Arc::clone(&task_url);
+    let state = queue_state.clone();
+    let found_debug = found_urls.map(move |item| {
+        debug!("submitting URL {}, extracted from {}", &item, &url);
+        state.url_enqueued(); // TODO: is this really _sure_?
+        item
+    });
+    let url = Arc::clone(&task_url);
+    let state = queue_state;
+    let store = Arc::clone(&url_store);
+    found_debug
+        .forward(url_sink)
+        .map(move |_url_sink| ())
+        .then(move |result| {
+            debug!("extraction for {} done ({:?})", url, state);
+            state.extraction_done();
+            if state.is_done() {
+                return Err(ExtractError::Finished);
+            }
+            result
+        })
+        .or_else(move |e| {
+            match e {
+                ExtractError::Utf8(e) => eprintln!("could not parse {}: {}", task_url, e),
+                ExtractError::Redirect(url) => {
+                    store.add_redirect(task_url, Arc::new(url));
+                }
+                _ => return Err(e),
+            }
+            Ok(())
+        })
 }
 
 #[derive(Debug)]
