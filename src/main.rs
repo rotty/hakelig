@@ -38,12 +38,10 @@ where
             .and_then(move |ft| {
                 let entries = if ft.is_dir() {
                     dir_lister(path, predicate)
+                } else if predicate(&path) {
+                    Box::new(stream::once(Ok(path.into_boxed_path()))) as PathStream
                 } else {
-                    if predicate(&path) {
-                        Box::new(stream::once(Ok(path.into_boxed_path()))) as PathStream
-                    } else {
-                        Box::new(stream::empty()) as PathStream
-                    }
+                    Box::new(stream::empty()) as PathStream
                 };
                 future::ok(entries)
             })
@@ -163,10 +161,10 @@ struct Opt {
     link_ignore: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueueState(Arc<QueueStateInner>);
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct QueueStateInner {
     /// Wether the root-finding process is done
     roots_done: AtomicBool,
@@ -180,19 +178,14 @@ struct QueueStateInner {
 
 impl QueueState {
     pub fn new() -> Self {
-        QueueState(Arc::new(QueueStateInner {
-            roots_done: AtomicBool::new(false),
-            waiting: AtomicUsize::new(0),
-            extracting: AtomicUsize::new(0),
-            queued: AtomicUsize::new(0),
-        }))
+        QueueState::default()
     }
     pub fn is_done(&self) -> bool {
         let inner = &self.0;
-        return inner.roots_done.load(Ordering::SeqCst)
+        inner.roots_done.load(Ordering::SeqCst)
             && inner.waiting.load(Ordering::SeqCst) == 0
             && inner.extracting.load(Ordering::SeqCst) == 0
-            && inner.queued.load(Ordering::SeqCst) == 0;
+            && inner.queued.load(Ordering::SeqCst) == 0
     }
     pub fn roots_done(&self) {
         self.0.roots_done.store(true, Ordering::SeqCst)
@@ -346,7 +339,7 @@ fn main() -> Result<(), Error> {
         //let reference_count = references.count();
         println!("{}:", url);
         for (anchor, referrers) in references {
-            if referrers.len() == 0 {
+            if referrers.is_empty() {
                 continue;
             }
             match anchor {

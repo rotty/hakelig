@@ -102,8 +102,7 @@ fn extract(
         (queue, tokenizer, vec![]),
         |_| (),
         |buf, (mut queue, mut tokenizer, mut remainder)| {
-            // FIXME: UTF8 parsing may fail inadvertently at buffer boundaries
-            let (s, remainder) = if remainder.len() == 0 {
+            let (s, remainder) = if remainder.is_empty() {
                 from_utf8_partial(&buf)?
             } else {
                 remainder.extend(&buf);
@@ -137,13 +136,9 @@ lazy_static! {
 /// Checks for a `http-equiv=refresh` attribute and returns the URL inside the
 /// `content` attribute, if present.
 fn meta_refresh_url(attrs: &[Attribute]) -> Option<&str> {
-    if attrs
+    attrs
         .iter()
-        .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")
-        .is_none()
-    {
-        return None;
-    }
+        .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")?;
     attr_value(attrs, "content").and_then(|content| {
         CONTENT_REDIRECT_RE
             .captures(content)
@@ -368,7 +363,7 @@ where
     F: FnMut(S::Item, T) -> Fut,
     Fut: IntoFuture<Item = (It, T)>,
 {
-    let transformed = stream::unfold(
+    stream::unfold(
         (stream, init, step, finish, false),
         move |(s, seed, mut step, finish, eof)| {
             if eof {
@@ -393,6 +388,5 @@ where
             }
         },
     )
-    .filter_map(|item| item);
-    transformed
+    .filter_map(|item| item)
 }
