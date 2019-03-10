@@ -18,15 +18,18 @@ use std::sync::Arc;
 
 use failure::Error;
 use futures::{stream, Future, Stream};
+use reqwest::r#async as rq;
 use std::io;
 use tokio::fs;
 use url::Url;
 
 pub type EntityStream = Box<dyn Stream<Item = Box<dyn Entity + Send>, Error = Error> + Send>;
 
+type ChunkStream = Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send>;
+
 pub trait Entity {
     fn url(&self) -> Arc<Url>;
-    fn read_chunks(&self) -> Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send>;
+    fn read_chunks(&self) -> ChunkStream;
 }
 
 struct HtmlPath {
@@ -50,7 +53,7 @@ impl Entity for HtmlPath {
     fn url(&self) -> Arc<Url> {
         self.url.clone()
     }
-    fn read_chunks(&self) -> Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send> {
+    fn read_chunks(&self) -> ChunkStream {
         let buf = vec![0u8; 4096];
         let links = fs::File::open(self.path.clone())
             .map(|file| {
@@ -71,6 +74,46 @@ impl Entity for HtmlPath {
             })
             .flatten_stream();
         Box::new(links)
+    }
+}
+
+struct HttpUrl {
+    url: Arc<Url>,
+}
+
+impl HttpUrl {
+    fn new(url: Arc<Url>) -> Self {
+        HttpUrl { url }
+    }
+}
+
+impl Entity for HttpUrl {
+    fn url(&self) -> Arc<Url> {
+        Arc::clone(&self.url)
+    }
+    fn read_chunks(&self) -> ChunkStream {
+        // TODO: use dedicated error type
+        // TODO: record redirects (use custom RedirectPolicy)
+        let chunks = rq::Client::new()
+            .get(self.url.as_ref().clone())
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map(|response| {
+                response
+                    .into_body()
+                    .map(|chunk| Vec::from(chunk.as_ref()))
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("reading HTTP response failed: {}", e),
+                        )
+                    })
+            })
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("HTTP request failed: {}", e))
+            })
+            .flatten_stream();
+        Box::new(chunks)
     }
 }
 
@@ -98,6 +141,7 @@ pub fn classify_url(url: &Url) -> Option<Box<dyn Entity + Send>> {
             })
             .ok()
             .and_then(|path| classify_path(&path)),
+        "http" => Some(Box::new(HttpUrl::new(Arc::new(url.clone())))),
         _ => None,
     }
 }
