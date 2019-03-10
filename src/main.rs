@@ -346,12 +346,15 @@ fn main() -> Result<(), Error> {
         //let reference_count = references.count();
         println!("{}:", url);
         for (anchor, referrers) in references {
+            if referrers.len() == 0 {
+                continue;
+            }
             match anchor {
                 Some(anchor) => println!("  references to {}", anchor),
                 None => println!("  document references"),
             }
             for referrer in referrers {
-                println!("    {}", referrer);
+                println!("    {}, href {}", referrer.url(), referrer.href());
             }
         }
     }

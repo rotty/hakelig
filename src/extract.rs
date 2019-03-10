@@ -21,7 +21,7 @@ use crate::store::Store;
 
 #[derive(Debug)]
 enum Extracted {
-    Url(Url),
+    Link(Box<str>),
     Anchor(Box<str>),
 }
 
@@ -143,15 +143,8 @@ impl ExtractSink {
     }
     fn extract_tag(&mut self, name: &str, attrs: &[Attribute]) -> TokenSinkResult<Redirect> {
         if name == "a" {
-            if let Some(href) = attr_value(attrs, "href").and_then(|value| {
-                self.base
-                    .join(value)
-                    .map_err(|_| {
-                        eprintln!("could not parse URL `{}'", value);
-                    })
-                    .ok()
-            }) {
-                self.output.push(Extracted::Url(href))
+            if let Some(href) = attr_value(attrs, "href") {
+                self.output.push(Extracted::Link(href.into()))
             }
         } else if name == "meta" {
             if attrs
@@ -282,8 +275,8 @@ fn process_url(
     let operations = extract(Arc::clone(&url), chunk_source).filter_map(move |extracted| {
         //dbg!(&extracted);
         match extracted {
-            Extracted::Url(link) => {
-                if let Some(unknown_url) = store.add_link(Arc::new(link), Arc::clone(&url)) {
+            Extracted::Link(link) => {
+                if let Some(unknown_url) = store.add_link(Arc::clone(&url), link) {
                     Some(Operation::SinkUrl(unknown_url))
                 } else {
                     None

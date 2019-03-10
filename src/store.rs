@@ -10,24 +10,28 @@ use url::Url;
 
 type AnchorSet = HashSet<Box<str>>;
 
+/// The references to a document.
 #[derive(Default)]
 struct References {
-    anchored: HashMap<Box<str>, Vec<Arc<Url>>>,
-    plain: Vec<Arc<Url>>,
+    /// For each anchor, the list of referrers
+    anchored: HashMap<Box<str>, Vec<Referrer>>,
+    /// The list of referrers that do not have a fragment (i.e. reference the
+    /// document as a whole).
+    plain: Vec<Referrer>,
 }
 
 impl References {
     fn is_empty(&self) -> bool {
         self.anchored.is_empty() && self.plain.is_empty()
     }
-    fn add(&mut self, anchor: Option<Box<str>>, referrer: Arc<Url>) {
+    fn add(&mut self, anchor: Option<Box<str>>, referrer: Referrer) {
         if let Some(anchor) = anchor {
             self.add_anchored(anchor, referrer);
         } else {
             self.plain.push(referrer);
         }
     }
-    fn add_anchored(&mut self, anchor: Box<str>, referrer: Arc<Url>) {
+    fn add_anchored(&mut self, anchor: Box<str>, referrer: Referrer) {
         self.anchored
             .entry(anchor)
             .or_insert_with(Vec::new)
@@ -35,31 +39,44 @@ impl References {
     }
     fn extend_anchored<I>(&mut self, anchor: Box<str>, referrers: I)
     where
-        I: IntoIterator<Item = Arc<Url>>,
+        I: IntoIterator<Item = Referrer>,
     {
         self.anchored
             .entry(anchor)
             .or_insert_with(Vec::new)
             .extend(referrers);
     }
-    fn into_inner(self) -> (HashMap<Box<str>, Vec<Arc<Url>>>, Vec<Arc<Url>>) {
+    fn into_inner(self) -> (HashMap<Box<str>, Vec<Referrer>>, Vec<Referrer>) {
         (self.anchored, self.plain)
     }
-    fn referrers(&self) -> impl Iterator<Item = &Url> {
+    fn referrers(&self) -> impl Iterator<Item = &Referrer> {
         // TODO: uniquify referrers
-        self.anchored
-            .values()
-            .flatten()
-            .map(|r| r.as_ref())
-            .chain(self.plain.iter().map(|r| r.as_ref()))
+        self.anchored.values().flatten().chain(self.plain.iter())
     }
-    fn anchored(&self) -> impl Iterator<Item = (&str, impl Iterator<Item = &Url>)> {
+    fn anchored(&self) -> impl Iterator<Item = (&str, impl Iterator<Item = &Referrer>)> {
         self.anchored
             .iter()
-            .map(|(a, referrers)| (a.as_ref(), referrers.iter().map(|r| r.as_ref())))
+            .map(|(a, referrers)| (a.as_ref(), referrers.iter()))
     }
-    fn plain(&self) -> impl Iterator<Item = &Url> {
-        self.plain.iter().map(|u| u.as_ref())
+    fn plain(&self) -> impl Iterator<Item = &Referrer> {
+        self.plain.iter()
+    }
+}
+
+/// A reference to some other URL.
+pub struct Referrer {
+    /// The referencing URL.
+    url: Arc<Url>,
+    /// The link (href attribute) in that URL.
+    href: Box<str>,
+}
+
+impl Referrer {
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+    pub fn href(&self) -> &str {
+        &self.href
     }
 }
 
@@ -79,7 +96,7 @@ impl Document {
 }
 
 impl Document {
-    fn add_referrer(&mut self, anchor: Option<Box<str>>, referrer: Arc<Url>) {
+    fn add_referrer(&mut self, anchor: Option<Box<str>>, referrer: Referrer) {
         if let Some(anchor) = anchor {
             if !self.anchors.contains(&anchor) {
                 self.unresolved.add_anchored(anchor, referrer);
@@ -88,7 +105,7 @@ impl Document {
     }
     fn add_referrers<I>(&mut self, anchor: Option<Box<str>>, referrers: I)
     where
-        I: IntoIterator<Item = Arc<Url>>,
+        I: IntoIterator<Item = Referrer>,
     {
         if let Some(anchor) = anchor {
             if !self.anchors.contains(&anchor) {
@@ -156,19 +173,30 @@ impl Store {
         guard.touched.insert(url)
     }
 
-    pub fn add_link(&self, url: Arc<Url>, referrer: Arc<Url>) -> Option<Arc<Url>> {
+    pub fn add_link(&self, document_url: Arc<Url>, href: Box<str>) -> Option<Arc<Url>> {
+        let target = document_url
+            .join(&href)
+            .map_err(|_| {
+                // FIXME: this should not output
+                eprintln!("could not parse link `{}'", href);
+            })
+            .ok()?;
         //dbg!(&url);
         let mut guard = self.0.lock().expect("store mutex poisoned");
-        if guard.link_ignore.is_match(url.as_str()) {
+        if guard.link_ignore.is_match(target.as_str()) {
             return None;
         }
-        let (url, fragment) = match url.fragment() {
+        let (url, fragment) = match target.fragment() {
             Some(fragment) if !fragment.is_empty() => {
-                let mut url = (*url).clone();
-                url.set_fragment(None);
-                (Arc::new(url), Some(fragment))
+                let mut target = target.clone();
+                target.set_fragment(None);
+                (Arc::new(target), Some(fragment))
             }
-            _ => (Arc::clone(&url), None),
+            _ => (Arc::new(target), None),
+        };
+        let referrer = Referrer {
+            url: document_url,
+            href,
         };
         let url = Arc::clone(guard.redirects.get(&url).unwrap_or(&url));
         if let Some(doc) = guard.documents.get_mut(&url) {
@@ -202,7 +230,7 @@ impl Store {
 pub struct LockedStore<'a>(MutexGuard<'a, StoreInner>);
 
 impl<'a> LockedStore<'a> {
-    pub fn dangling(&'a self) -> impl Iterator<Item = (&'a Url, bool, Vec<&'a Url>)> {
+    pub fn dangling(&'a self) -> impl Iterator<Item = (&'a Url, bool, Vec<&'a Referrer>)> {
         self.0
             .unknown
             .iter()
@@ -214,7 +242,7 @@ impl<'a> LockedStore<'a> {
     ) -> impl Iterator<
         Item = (
             &'a Url,
-            impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>,
+            impl Iterator<Item = (Option<&'a str>, Vec<&'a Referrer>)>,
         ),
     > {
         self.0.documents.iter().filter_map(document_known_dangling)
@@ -223,13 +251,13 @@ impl<'a> LockedStore<'a> {
 
 fn unknown_dangling<'a>(
     (url, references): (&'a Arc<Url>, &'a References),
-) -> (&'a Url, bool, Vec<&'a Url>) {
+) -> (&'a Url, bool, Vec<&'a Referrer>) {
     (&url, false, references.referrers().collect())
 }
 
 fn document_dangling<'a>(
     (url, document): (&'a Arc<Url>, &'a Document),
-) -> Option<(&'a Url, bool, Vec<&'a Url>)> {
+) -> Option<(&'a Url, bool, Vec<&'a Referrer>)> {
     if document.unresolved.is_empty() {
         None
     } else {
@@ -241,7 +269,7 @@ fn document_known_dangling<'a>(
     (url, document): (&'a Arc<Url>, &'a Document),
 ) -> Option<(
     &'a Url,
-    impl Iterator<Item = (Option<&'a str>, Vec<&'a Url>)>,
+    impl Iterator<Item = (Option<&'a str>, Vec<&'a Referrer>)>,
 )> {
     if document.unresolved.is_empty() {
         None
