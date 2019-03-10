@@ -1,17 +1,23 @@
-#![type_length_limit = "2097152"]
+#![type_length_limit = "4194304"]
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 use failure::Error;
 use futures::sink::Sink;
 use futures::{future, stream, Future, Stream};
+use log::debug;
+use regex::RegexSet;
 use structopt::StructOpt;
 use tokio::fs;
 use tokio::sync::mpsc;
+use tokio::timer;
 use url::Url;
-use regex::RegexSet;
 
 mod extract;
 mod store;
@@ -46,7 +52,7 @@ where
     Box::new(entries.flatten())
 }
 
-type EntityStream = Box<dyn Stream<Item = Box<dyn Entity>, Error = Error> + Send>;
+type EntityStream = Box<dyn Stream<Item = Box<dyn Entity + Send>, Error = Error> + Send>;
 
 fn list_root<P>(path: P) -> EntityStream
 where
@@ -59,8 +65,8 @@ where
             if metadata.file_type().is_dir() {
                 Box::new(
                     dir_lister(path, Arc::new(|_| true))
-                        .filter_map(|p| classify_path(&p))
-                        .map_err(Error::from),
+                        .map_err(Error::from)
+                        .filter_map(|p| classify_path(&p)),
                 ) as EntityStream
             } else {
                 Box::new(stream::once(Ok(path)).filter_map(|p| classify_path(p.as_ref())))
@@ -122,12 +128,12 @@ impl Entity for HtmlPath {
     }
 }
 
-fn classify_path(path: &Path) -> Option<Box<dyn Entity>> {
+fn classify_path(path: &Path) -> Option<Box<dyn Entity + Send>> {
     path.extension()
         .and_then(|ext| ext.to_str())
         .and_then(|ext| match ext {
             "html" | "htm" => match HtmlPath::new(&path) {
-                Ok(entity) => Some(Box::new(entity) as Box<Entity>),
+                Ok(entity) => Some(Box::new(entity) as Box<Entity + Send>),
                 Err(_) => {
                     eprintln!("could not represent filename {} as an URL", path.display());
                     None
@@ -137,6 +143,19 @@ fn classify_path(path: &Path) -> Option<Box<dyn Entity>> {
         })
 }
 
+fn classify_url(url: &Url) -> Option<Box<dyn Entity + Send>> {
+    match url.scheme() {
+        "file" => url
+            .to_file_path()
+            .map_err(|_| {
+                eprintln!("could not construct file path from URL {}", url);
+            })
+            .ok()
+            .and_then(|path| classify_path(&path)),
+        _ => None,
+    }
+}
+
 #[derive(StructOpt)]
 struct Opt {
     root: PathBuf,
@@ -144,37 +163,164 @@ struct Opt {
     link_ignore: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueueState(Arc<QueueStateInner>);
+
+#[derive(Debug)]
+struct QueueStateInner {
+    /// Wether the root-finding process is done
+    roots_done: AtomicBool,
+    /// How many tasks are queued for extraction
+    waiting: AtomicUsize,
+    /// How many extraction tasks are currently being processed
+    extracting: AtomicUsize,
+    /// How many URLs are waiting to be processed
+    queued: AtomicUsize,
+}
+
+impl QueueState {
+    pub fn new() -> Self {
+        QueueState(Arc::new(QueueStateInner {
+            roots_done: AtomicBool::new(false),
+            waiting: AtomicUsize::new(0),
+            extracting: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+        }))
+    }
+    pub fn is_done(&self) -> bool {
+        let inner = &self.0;
+        return inner.roots_done.load(Ordering::SeqCst)
+            && inner.waiting.load(Ordering::SeqCst) == 0
+            && inner.extracting.load(Ordering::SeqCst) == 0
+            && inner.queued.load(Ordering::SeqCst) == 0;
+    }
+    pub fn roots_done(&self) {
+        self.0.roots_done.store(true, Ordering::SeqCst)
+    }
+    pub fn extraction_enqueued(&self) {
+        self.0.waiting.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn extraction_dequeued(&self) {
+        self.0.extracting.fetch_add(1, Ordering::SeqCst);
+        let previous = self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0);
+    }
+    pub fn extraction_done(&self) {
+        let previous = self.0.extracting.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0);
+    }
+    pub fn url_enqueued(&self) {
+        self.0.queued.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn url_dequeued(&self) {
+        let previous = self.0.queued.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0);
+    }
+}
+
+fn submit_entities<S>(
+    entities: S,
+    sink: mpsc::Sender<ExtractTask>,
+    store: Arc<Store>,
+    queue_state: QueueState,
+) -> impl Future<Item = (), Error = Error>
+where
+    S: Stream<Item = Box<dyn Entity + Send>, Error = Error> + Send + 'static,
+{
+    entities
+        .map_err(Error::from)
+        .filter_map(move |entity| {
+            let url = entity.url();
+            debug!("dequeued {}", &url);
+            if !store.touch(Arc::clone(&url)) {
+                queue_state.url_dequeued();
+                debug!("{} already in store", &url);
+                return None;
+            }
+            let chunks = entity.read_chunks();
+            let (chunk_sink, chunk_source) = mpsc::channel(100);
+            let tasks = sink.clone();
+            let log_url = Arc::clone(&url);
+            let log_url2 = Arc::clone(&url);
+            debug!("queuing task for {}", &url);
+            queue_state.extraction_enqueued();
+            queue_state.url_dequeued();
+            let submit = tasks
+                .send(ExtractTask::new(Arc::clone(&url), chunk_source))
+                .map(move |f| {
+                    debug!("queued {}", log_url);
+                    f
+                })
+                .map_err(Error::from)
+                .and_then(move |_| {
+                    chunks
+                        .map_err(Error::from)
+                        .forward(chunk_sink)
+                        .map(move |_| {
+                            debug!("done sending chunks {}", log_url2);
+                        })
+                })
+                .or_else(move |e| {
+                    eprintln!("error processing {}: {}", Arc::clone(&url), e);
+                    Ok(())
+                });
+            Some(submit)
+        })
+        .for_each(|item| item)
+}
+
 fn main() -> Result<(), Error> {
+    env_logger::init();
+
     let opt = Opt::from_args();
     let link_ignore_set = RegexSet::new(opt.link_ignore)?;
     let store = Arc::new(Store::new(link_ignore_set));
-    let (url_sink, url_source): (mpsc::Sender<Arc<Url>>, _) = mpsc::channel(100);
-    let (task_sink, task_source) = mpsc::channel(20);
-    let find_roots = list_root(opt.root)
-        .map(|entity| future::ok((entity.url(), entity.read_chunks())))
-        .buffer_unordered(10)
-        .map(move |(url, chunks)| {
-            let (chunk_sink, chunk_source) = mpsc::channel(100);
-            let tasks = task_sink.clone();
-            tasks
-                .send(ExtractTask::new(Arc::clone(&url), chunk_source))
-                .map_err(Error::from)
-                .and_then(|_| chunks.map_err(Error::from).forward(chunk_sink).map(|_| ()))
-        })
-        .buffer_unordered(10)
-        .for_each(|_| future::ok(()))
-        .map_err(|e| {
-            eprintln!("error: {}", e);
+    let (found_sink, found_source) = mpsc::unbounded_channel();
+    let (task_sink, task_source) = mpsc::channel(1);
+    let state = QueueState::new();
+    let root_enqueue_state = state.clone();
+    let roots = list_root(opt.root).map(move |entity| {
+        root_enqueue_state.url_enqueued();
+        entity
+    });
+    let root_submit_state = state.clone();
+    let submit_roots = submit_entities(roots, task_sink.clone(), Arc::clone(&store), state.clone()).map_err(|e| {
+        eprintln!("could not pass root stream to extractor: {}", e);
+    }).then(move |result| {
+        debug!("submitting roots done");
+        root_submit_state.roots_done();
+        result
+    });
+    let task_executor = extraction_thread(Arc::clone(&store), task_source, found_sink, state.clone());
+    let found_state = state.clone();
+    let found_entities = found_source
+        .map_err(Error::from)
+        .filter_map(move |url| match classify_url(&url) {
+            None => { found_state.url_dequeued(); None }
+            Some(entity) => Some(entity),
         });
-    let task_executor = extraction_thread(Arc::clone(&store), task_source, url_sink);
-    let consume = url_source
-        .for_each(|_url| {
-            //println!("found: {}", url);
-            future::ok(())
-        })
-        .map_err(|_| ());
-    let run_both = future::lazy(|| tokio::spawn(consume)).and_then(|_| find_roots);
-    tokio::run(run_both);
+    let process_found_urls = submit_entities(found_entities, task_sink, Arc::clone(&store), state.clone())
+        .map_err(|e| {
+            eprintln!("error processing found URLs: {}", e);
+        }).then(|result| {
+            debug!("processing new URLs is done");
+            result
+        });
+    let queue_state_printer = timer::Interval::new_interval(Duration::from_millis(10)).map_err(|e| {
+        eprintln!("timer for queue state printer failed: {}", e);
+    }).for_each(move |_instant| {
+        eprintln!("queue state: {:?}", state);
+        if state.is_done() {
+            return Err(());
+        }
+        Ok(())
+    });
+    let run = future::lazy(|| {
+        tokio::spawn(queue_state_printer);
+        tokio::spawn(process_found_urls)
+    }).and_then(|_| submit_roots);
+    tokio::run(run);
+    dbg!("DONE");
     task_executor
         .join()
         .expect("joining extractor thread failed");

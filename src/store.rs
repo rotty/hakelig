@@ -101,6 +101,8 @@ struct StoreInner {
     documents: HashMap<Arc<Url>, Document>,
     // Redirected URLs
     redirects: HashMap<Arc<Url>, Arc<Url>>,
+    // URLs we have already touched (i.e. are about to process or already have processed)
+    touched: HashSet<Arc<Url>>,
 }
 
 #[derive(Debug)]
@@ -121,9 +123,11 @@ impl Store {
             unknown: Default::default(),
             documents: Default::default(),
             redirects: Default::default(),
+            touched: Default::default(),
         }))
     }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
+        //dbg!(("RESOLVE", &url));
         use hash_map::Entry;
         let mut guard = self.0.lock().expect("store mutex poisoned");
         let references = guard.unknown.remove(&url);
@@ -139,7 +143,13 @@ impl Store {
         }
         Ok(())
     }
+    pub fn touch(&self, url: Arc<Url>) -> bool {
+        let mut guard = self.0.lock().expect("store mutex poisoned");
+        guard.touched.insert(url)
+    }
+
     pub fn add_link(&self, url: Arc<Url>, referrer: Arc<Url>) -> Option<Arc<Url>> {
+        //dbg!(&url);
         let mut guard = self.0.lock().expect("store mutex poisoned");
         if guard.link_ignore.is_match(url.as_str()) {
             return None;
@@ -156,17 +166,24 @@ impl Store {
         if let Some(doc) = guard.documents.get_mut(&url) {
             doc.add_referrer(fragment.map(Into::into), referrer);
             None
+        } else if let Some(unknown) = guard.unknown.get_mut(&url) {
+            unknown.add(fragment.map(Into::into), referrer);
+            None
         } else {
             guard
                 .unknown
                 .entry(Arc::clone(&url))
                 .or_insert_with(References::default)
                 .add(fragment.map(Into::into), referrer);
+            //dbg!(&url);
             Some(url)
         }
     }
     pub fn add_redirect(&self, url: Arc<Url>, to: Arc<Url>) {
         let mut guard = self.0.lock().expect("store mutex poisoned");
+        if let Some(references) = guard.unknown.remove(&url) {
+            guard.unknown.insert(Arc::clone(&to), references);
+        }
         guard.redirects.insert(url, to);
     }
     pub fn lock(&self) -> LockedStore {
