@@ -32,11 +32,12 @@ use structopt::StructOpt;
 use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::timer;
-use url::Url;
 
+mod entity;
 mod extract;
 mod store;
 
+use entity::{Entity, EntityStream};
 use extract::{extraction_thread, ExtractTask};
 use store::Store;
 
@@ -65,8 +66,6 @@ where
     Box::new(entries.flatten())
 }
 
-type EntityStream = Box<dyn Stream<Item = Box<dyn Entity + Send>, Error = Error> + Send>;
-
 fn list_root<P>(path: P) -> EntityStream
 where
     P: AsRef<Path> + Send + Sync + 'static,
@@ -79,94 +78,16 @@ where
                 Box::new(
                     dir_lister(path, Arc::new(|_| true))
                         .map_err(Error::from)
-                        .filter_map(|p| classify_path(&p)),
+                        .filter_map(|p| entity::classify_path(&p)),
                 ) as EntityStream
             } else {
-                Box::new(stream::once(Ok(path)).filter_map(|p| classify_path(p.as_ref())))
+                Box::new(stream::once(Ok(path)).filter_map(|p| entity::classify_path(p.as_ref())))
                     as EntityStream
             }
         })
         .map_err(Error::from)
         .flatten_stream();
     Box::new(stream)
-}
-
-trait Entity {
-    fn url(&self) -> Arc<Url>;
-    fn read_chunks(&self) -> Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send>;
-}
-
-struct HtmlPath {
-    path: Box<Path>,
-    url: Arc<Url>,
-}
-
-impl HtmlPath {
-    fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut abs_path = std::env::current_dir()?;
-        abs_path.push(path);
-        let url = Url::from_file_path(&abs_path).expect("unrepresentable path");
-        Ok(HtmlPath {
-            path: abs_path.into(),
-            url: Arc::new(url),
-        })
-    }
-}
-
-impl Entity for HtmlPath {
-    fn url(&self) -> Arc<Url> {
-        self.url.clone()
-    }
-    fn read_chunks(&self) -> Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send> {
-        let buf = vec![0u8; 4096];
-        let links = fs::File::open(self.path.clone())
-            .map(|file| {
-                stream::unfold((file, buf, false), |(file, buf, eof)| {
-                    if eof {
-                        None
-                    } else {
-                        let read = tokio::io::read(file, buf).map(|(file, buf, n_read)| {
-                            if n_read == 0 {
-                                (Vec::new(), (file, buf, true))
-                            } else {
-                                (Vec::from(&buf[..n_read]), (file, buf, false))
-                            }
-                        });
-                        Some(read)
-                    }
-                })
-            })
-            .flatten_stream();
-        Box::new(links)
-    }
-}
-
-fn classify_path(path: &Path) -> Option<Box<dyn Entity + Send>> {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(|ext| match ext {
-            "html" | "htm" => match HtmlPath::new(&path) {
-                Ok(entity) => Some(Box::new(entity) as Box<Entity + Send>),
-                Err(_) => {
-                    eprintln!("could not represent filename {} as an URL", path.display());
-                    None
-                }
-            },
-            _ => None,
-        })
-}
-
-fn classify_url(url: &Url) -> Option<Box<dyn Entity + Send>> {
-    match url.scheme() {
-        "file" => url
-            .to_file_path()
-            .map_err(|_| {
-                eprintln!("could not construct file path from URL {}", url);
-            })
-            .ok()
-            .and_then(|path| classify_path(&path)),
-        _ => None,
-    }
 }
 
 #[derive(StructOpt)]
@@ -313,7 +234,7 @@ fn main() -> Result<(), Error> {
     let found_entities =
         found_source
             .map_err(Error::from)
-            .filter_map(move |url| match classify_url(&url) {
+            .filter_map(move |url| match entity::classify_url(&url) {
                 None => {
                     found_state.url_dequeued();
                     None
