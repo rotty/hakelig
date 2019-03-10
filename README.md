@@ -10,11 +10,11 @@ documentation emitted by `cargo doc` to the local filesystem.
 ## What works
 
 - Local, recursive link checking for HTML documents, using the
-  [`html5ever`] tokenizer to extract the links.
+  [`html5ever`][html5ever] tokenizer to extract the links.
 
 - Support for URL fragments (anchors).
 
-- Concurrent, futures-based architecture using [`tokio`]. The
+- Concurrent, futures-based architecture using [`tokio`][tokio]. The
   retrieval side can operate on many documents in parallel, making use
   of Tokio's threadpool. The extraction is done concurrently as well,
   but in a single thread, as `html5ever` is not thread-safe. So if you
@@ -26,17 +26,17 @@ documentation emitted by `cargo doc` to the local filesystem.
   can churn through about 27MiB of link-rich documentation output by
   `cargo doc` in about a second.
 
-[`tokio`]: https://tokio.rs/
-[`html5ever`]: https://github.com/servo/html5ever
+[tokio]: https://tokio.rs/
+[html5ever]: https://github.com/servo/html5ever
 
 ## What's next
 
 - [ ] Reasonable output and progress indication, probably taking
-      [`linkchecker`] as a source of inspiration.
+      [linkchecker] as a source of inspiration.
 
 - [ ] HTTP support.
 
-[`linkchecker`]: https://linkchecker.github.io/linkchecker/
+[linkchecker]: https://linkchecker.github.io/linkchecker/
 
 ## License
 
