@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+//! A thread-safe store for the link-checking results.
+
 #![allow(dead_code)]
 
 use std::collections::{hash_map, HashMap, HashSet};
@@ -26,7 +28,7 @@ use url::Url;
 type AnchorSet = HashSet<Box<str>>;
 
 /// The references to a document.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct References {
     /// For each anchor, the list of referrers
     anchored: HashMap<Box<str>, Vec<Referrer>>,
@@ -79,6 +81,7 @@ impl References {
 }
 
 /// A reference to some other URL.
+#[derive(Debug)]
 pub struct Referrer {
     /// The referencing URL.
     url: Arc<Url>,
@@ -92,6 +95,17 @@ impl Referrer {
     }
     pub fn href(&self) -> &str {
         &self.href
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    DuplicateDocument,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "duplicate document")
     }
 }
 
@@ -130,10 +144,19 @@ impl Document {
     }
 }
 
-pub struct Store(Mutex<StoreInner>);
-
-struct StoreInner {
+pub struct Store {
+    // Links are ignored (not followed) if they match this pattern.
     link_ignore: RegexSet,
+    // Set of root urls, every URL below these is considered internal, and
+    // queued for link extraction. If `None`, recursion is not restricted by
+    // URL.
+    restrict_urls: Option<Vec<Url>>,
+    // The mutable part.
+    inner: Mutex<StoreInner>,
+}
+
+#[derive(Default)]
+struct StoreInner {
     // State of these links is unknown, they get moved to `documents` on
     // `resolve`.
     unknown: HashMap<Arc<Url>, References>,
@@ -145,30 +168,64 @@ struct StoreInner {
     touched: HashSet<Arc<Url>>,
 }
 
-#[derive(Debug)]
-pub enum Error {
-    DuplicateDocument,
+impl Store {
+    fn is_restricted(&self, url: &Url) -> bool {
+        if let Some(restrictions) = &self.restrict_urls {
+            !restrictions
+                .iter()
+                .any(|restrict_url| url_is_below(restrict_url, url))
+        } else {
+            false
+        }
+    }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "duplicate document")
+fn is_path_prefix<'a, T, U>(prefix: T, seq: U) -> bool
+where
+    T: IntoIterator<Item = &'a str>,
+    U: IntoIterator<Item = &'a str>,
+{
+    let mut seq = seq.into_iter();
+    for elt in prefix.into_iter() {
+        if elt.is_empty() {
+            continue;
+        }
+        match seq.next() {
+            None => return false,
+            Some(seq_elt) => {
+                if elt != seq_elt {
+                    return false;
+                }
+            }
+        }
     }
+    true
+}
+
+fn url_is_below(base: &Url, url: &Url) -> bool {
+    url.scheme() == base.scheme()
+        && url.host_str() == base.host_str()
+        && url.port_or_known_default() == base.port_or_known_default()
+        && match (base.path_segments(), url.path_segments()) {
+            (None, None) => true,
+            (Some(base_segments), Some(url_segments)) => {
+                is_path_prefix(base_segments, url_segments)
+            }
+            _ => false,
+        }
 }
 
 impl Store {
-    pub fn new(link_ignore: RegexSet) -> Self {
-        Store(Mutex::new(StoreInner {
+    pub fn new(link_ignore: RegexSet, restrict: Option<Vec<Url>>) -> Self {
+        Store {
             link_ignore,
-            unknown: Default::default(),
-            documents: Default::default(),
-            redirects: Default::default(),
-            touched: Default::default(),
-        }))
+            restrict_urls: restrict,
+            inner: Mutex::new(StoreInner::default()),
+        }
     }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
         use hash_map::Entry;
-        let mut guard = self.0.lock().expect("store mutex poisoned");
+        let mut guard = self.inner.lock().expect("store mutex poisoned");
         let references = guard.unknown.remove(&url);
         let doc = match guard.documents.entry(Arc::clone(&url)) {
             Entry::Occupied(_) => return Err(Error::DuplicateDocument),
@@ -183,11 +240,14 @@ impl Store {
         Ok(())
     }
     pub fn touch(&self, url: Arc<Url>) -> bool {
-        let mut guard = self.0.lock().expect("store mutex poisoned");
+        let mut guard = self.inner.lock().expect("store mutex poisoned");
         guard.touched.insert(url)
     }
 
     pub fn add_link(&self, document_url: Arc<Url>, href: Box<str>) -> Option<Arc<Url>> {
+        if self.link_ignore.is_match(&href) {
+            return None;
+        }
         let target = document_url
             .join(&href)
             .map_err(|_| {
@@ -195,10 +255,10 @@ impl Store {
                 eprintln!("could not parse link `{}'", href);
             })
             .ok()?;
-        let mut guard = self.0.lock().expect("store mutex poisoned");
-        if guard.link_ignore.is_match(target.as_str()) {
+        if self.is_restricted(&target) {
             return None;
         }
+        let mut guard = self.inner.lock().expect("store mutex poisoned");
         let (url, fragment) = match target.fragment() {
             Some(fragment) if !fragment.is_empty() => {
                 let mut target = target.clone();
@@ -232,14 +292,14 @@ impl Store {
         }
     }
     pub fn add_redirect(&self, url: Arc<Url>, to: Arc<Url>) {
-        let mut guard = self.0.lock().expect("store mutex poisoned");
+        let mut guard = self.inner.lock().expect("store mutex poisoned");
         if let Some(references) = guard.unknown.remove(&url) {
             guard.unknown.insert(Arc::clone(&to), references);
         }
         guard.redirects.insert(url, to);
     }
     pub fn lock(&self) -> LockedStore {
-        LockedStore(self.0.lock().expect("mutex poisoned"))
+        LockedStore(self.inner.lock().expect("mutex poisoned"))
     }
 }
 
@@ -297,5 +357,30 @@ fn document_known_dangling<'a>(
             .anchored()
             .map(|(anchor, referrers)| (Some(anchor), referrers.collect()));
         Some((&url, plain.chain(anchored)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_prefix() {
+        assert!(is_path_prefix(vec![], vec![]));
+        assert!(is_path_prefix(vec![], vec!["a", "b", "c"]));
+        assert!(is_path_prefix(vec!["a", "b"], vec!["a", "b", "c"]));
+        assert!(!is_path_prefix(vec!["a", "b", "c"], vec!["a", "b"]));
+    }
+
+    #[test]
+    fn test_url_is_below() {
+        assert!(url_is_below(
+            &Url::parse("http://example.com/").unwrap(),
+            &Url::parse("http://example.com/foo").unwrap(),
+        ));
+        assert!(url_is_below(
+            &Url::parse("http://example.com/").unwrap(),
+            &Url::parse("http://example.com/").unwrap(),
+        ));
     }
 }

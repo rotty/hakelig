@@ -15,8 +15,6 @@
 
 #![type_length_limit = "4194304"]
 
-use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
@@ -25,11 +23,10 @@ use std::time::Duration;
 
 use failure::Error;
 use futures::sink::Sink;
-use futures::{future, stream, Future, Stream};
+use futures::{future, Future, Stream};
 use log::debug;
 use regex::RegexSet;
 use structopt::StructOpt;
-use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::timer;
 
@@ -37,63 +34,14 @@ mod entity;
 mod extract;
 mod store;
 
-use entity::{Entity, EntityStream};
+use entity::Entity;
 use extract::{extraction_thread, ExtractTask};
 use store::Store;
 
-type PathStream = Box<dyn Stream<Item = Box<Path>, Error = io::Error> + Send>;
-
-fn dir_lister<P>(path: P, predicate: Arc<dyn Fn(&Path) -> bool + Send + Sync>) -> PathStream
-where
-    P: AsRef<Path> + Send + Sync + 'static,
-{
-    let entries = fs::read_dir(path).flatten_stream().map(move |entry| {
-        let path = entry.path();
-        let predicate = predicate.clone();
-        future::poll_fn(move || entry.poll_file_type())
-            .and_then(move |ft| {
-                let entries = if ft.is_dir() {
-                    dir_lister(path, predicate)
-                } else if predicate(&path) {
-                    Box::new(stream::once(Ok(path.into_boxed_path()))) as PathStream
-                } else {
-                    Box::new(stream::empty()) as PathStream
-                };
-                future::ok(entries)
-            })
-            .flatten_stream()
-    });
-    Box::new(entries.flatten())
-}
-
-fn list_root<P>(path: P) -> EntityStream
-where
-    P: AsRef<Path> + Send + Sync + 'static,
-{
-    let inner_path = path.as_ref().to_owned();
-    let stream = fs::metadata(path)
-        .map(|metadata| {
-            let path = inner_path;
-            if metadata.file_type().is_dir() {
-                Box::new(
-                    dir_lister(path, Arc::new(|_| true))
-                        .map_err(Error::from)
-                        .filter_map(|p| entity::classify_path(&p)),
-                ) as EntityStream
-            } else {
-                Box::new(stream::once(Ok(path)).filter_map(|p| entity::classify_path(p.as_ref())))
-                    as EntityStream
-            }
-        })
-        .map_err(Error::from)
-        .flatten_stream();
-    Box::new(stream)
-}
-
 #[derive(StructOpt)]
 struct Opt {
-    root: PathBuf,
-    #[structopt(long = "link-ignore")]
+    roots: Vec<String>,
+    #[structopt(long = "link-ignore", number_of_values = 1)]
     link_ignore: Vec<String>,
 }
 
@@ -154,7 +102,7 @@ fn submit_entities<S>(
     queue_state: QueueState,
 ) -> impl Future<Item = (), Error = Error>
 where
-    S: Stream<Item = Box<dyn Entity + Send>, Error = Error> + Send + 'static,
+    S: Stream<Item = Box<dyn Entity>, Error = Error> + Send + 'static,
 {
     entities
         .map_err(Error::from)
@@ -203,12 +151,18 @@ fn main() -> Result<(), Error> {
 
     let opt = Opt::from_args();
     let link_ignore_set = RegexSet::new(opt.link_ignore)?;
-    let store = Arc::new(Store::new(link_ignore_set));
+    let (mut root_urls, root_stream) = entity::list_roots(opt.roots);
+    for url in &mut root_urls {
+        url.set_fragment(None);
+        url.set_query(None);
+        url.path_segments_mut().expect("cannot-be-base URL").pop();
+    }
+    let store = Arc::new(Store::new(link_ignore_set, Some(root_urls)));
     let (found_sink, found_source) = mpsc::unbounded_channel();
     let (task_sink, task_source) = mpsc::channel(10);
     let state = QueueState::new();
     let root_enqueue_state = state.clone();
-    let roots = list_root(opt.root).map(move |entity| {
+    let roots = root_stream.map(move |entity| {
         root_enqueue_state.url_enqueued();
         entity
     });
