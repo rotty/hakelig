@@ -100,6 +100,7 @@ fn submit_entities<S>(
     sink: mpsc::Sender<ExtractTask>,
     store: Arc<Store>,
     queue_state: QueueState,
+    entity_ctx: Arc<entity::Context>,
 ) -> impl Future<Item = (), Error = Error>
 where
     S: Stream<Item = Box<dyn Entity>, Error = Error> + Send + 'static,
@@ -114,7 +115,7 @@ where
                 debug!("{} already in store", &url);
                 return None;
             }
-            let chunks = entity.read_chunks();
+            let chunks = entity.read_chunks(&entity_ctx);
             let (chunk_sink, chunk_source) = mpsc::channel(100);
             let tasks = sink.clone();
             let log_url = Arc::clone(&url);
@@ -168,20 +169,27 @@ fn main() -> Result<(), Error> {
     });
     let roots_done_state = state.clone();
     let sentinel_sink = task_sink.clone();
-    let submit_roots = submit_entities(roots, task_sink.clone(), Arc::clone(&store), state.clone())
-        .map_err(|e| {
-            eprintln!("could not pass root stream to extractor: {}", e);
-        })
-        .then(move |_| {
-            roots_done_state.roots_done();
-            debug!("submitting roots done: {:?}", roots_done_state);
-            sentinel_sink
-                .send(ExtractTask::sentinel())
-                .map_err(|e| {
-                    eprintln!("could not send root sentinel: {}", e);
-                })
-                .map(|_| ())
-        });
+    let ctx = Arc::new(entity::Context::new());
+    let submit_roots = submit_entities(
+        roots,
+        task_sink.clone(),
+        Arc::clone(&store),
+        state.clone(),
+        Arc::clone(&ctx),
+    )
+    .map_err(|e| {
+        eprintln!("could not pass root stream to extractor: {}", e);
+    })
+    .then(move |_| {
+        roots_done_state.roots_done();
+        debug!("submitting roots done: {:?}", roots_done_state);
+        sentinel_sink
+            .send(ExtractTask::sentinel())
+            .map_err(|e| {
+                eprintln!("could not send root sentinel: {}", e);
+            })
+            .map(|_| ())
+    });
     let task_executor =
         extraction_thread(Arc::clone(&store), task_source, found_sink, state.clone());
     let found_state = state.clone();
@@ -195,15 +203,20 @@ fn main() -> Result<(), Error> {
                 }
                 Some(entity) => Some(entity),
             });
-    let process_extracted_urls =
-        submit_entities(found_entities, task_sink, Arc::clone(&store), state.clone())
-            .map_err(|e| {
-                eprintln!("error processing found URLs: {}", e);
-            })
-            .then(|result| {
-                debug!("processing new URLs is done");
-                result
-            });
+    let process_extracted_urls = submit_entities(
+        found_entities,
+        task_sink,
+        Arc::clone(&store),
+        state.clone(),
+        Arc::clone(&ctx),
+    )
+    .map_err(|e| {
+        eprintln!("error processing found URLs: {}", e);
+    })
+    .then(|result| {
+        debug!("processing new URLs is done");
+        result
+    });
     let queue_state_printer = timer::Interval::new_interval(Duration::from_millis(100))
         .map_err(|e| {
             eprintln!("timer for queue state printer failed: {}", e);

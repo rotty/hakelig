@@ -24,13 +24,28 @@ use std::io;
 use tokio::fs;
 use url::Url;
 
+pub struct Context {
+    http_client: rq::Client,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Context {
+            http_client: rq::Client::new(),
+        }
+    }
+    pub fn http_get(&self, url: &Url) -> impl Future<Item = rq::Response, Error = reqwest::Error> {
+        self.http_client.get(url.clone()).send()
+    }
+}
+
 pub type EntityStream = Box<dyn Stream<Item = Box<dyn Entity>, Error = Error> + Send>;
 
 type ChunkStream = Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send>;
 
 pub trait Entity: Send {
     fn url(&self) -> Arc<Url>;
-    fn read_chunks(&self) -> ChunkStream;
+    fn read_chunks(&self, ctx: &Context) -> ChunkStream;
 }
 
 #[derive(Clone)]
@@ -55,7 +70,7 @@ impl Entity for HtmlPath {
     fn url(&self) -> Arc<Url> {
         self.url.clone()
     }
-    fn read_chunks(&self) -> ChunkStream {
+    fn read_chunks(&self, _: &Context) -> ChunkStream {
         let buf = vec![0u8; 4096];
         let links = fs::File::open(self.path.clone())
             .map(|file| {
@@ -94,12 +109,11 @@ impl Entity for HttpUrl {
     fn url(&self) -> Arc<Url> {
         Arc::clone(&self.url)
     }
-    fn read_chunks(&self) -> ChunkStream {
+    fn read_chunks(&self, ctx: &Context) -> ChunkStream {
         // TODO: use dedicated error type
         // TODO: record redirects (use custom RedirectPolicy)
-        let chunks = rq::Client::new()
-            .get(self.url.as_ref().clone())
-            .send()
+        let chunks = ctx
+            .http_get(self.url.as_ref())
             .and_then(|response| response.error_for_status())
             .map(|response| {
                 response
