@@ -224,7 +224,11 @@ impl Store {
                 .entry(Arc::clone(&url))
                 .or_insert_with(References::default)
                 .add(fragment.map(Into::into), referrer);
-            Some(url)
+            if guard.touched.get(&url).is_some() {
+                None
+            } else {
+                Some(url)
+            }
         }
     }
     pub fn add_redirect(&self, url: Arc<Url>, to: Arc<Url>) {
