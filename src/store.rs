@@ -25,6 +25,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use regex::RegexSet;
 use url::Url;
 
+#[derive(Debug, Clone)]
+pub struct FoundUrl(pub Arc<Url>, pub u32);
+
+impl FoundUrl {
+    pub fn new(url: Url) -> Self {
+        FoundUrl(Arc::new(url), 0)
+    }
+}
+
+impl fmt::Display for FoundUrl {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "<{}>[{}]", self.0, self.1)
+    }
+}
+
 type AnchorSet = HashSet<Box<str>>;
 
 /// The references to a document.
@@ -151,6 +166,8 @@ pub struct Store {
     // queued for link extraction. If `None`, recursion is not restricted by
     // URL.
     restrict_urls: Option<Vec<Url>>,
+    // Maximum recursion level (inclusive).
+    recursion_level: Option<u32>,
     // The mutable part.
     inner: Mutex<StoreInner>,
 }
@@ -216,11 +233,19 @@ fn url_is_below(base: &Url, url: &Url) -> bool {
 }
 
 impl Store {
-    pub fn new(link_ignore: RegexSet, restrict: Option<Vec<Url>>) -> Self {
+    pub fn new(link_ignore: RegexSet, restrict: Option<Vec<Url>>, level: Option<u32>) -> Self {
         Store {
             link_ignore,
             restrict_urls: restrict,
             inner: Mutex::new(StoreInner::default()),
+            recursion_level: level,
+        }
+    }
+    pub fn recurse_level(&self, level: u32) -> bool {
+        if let Some(max_level) = self.recursion_level {
+            level <= max_level
+        } else {
+            true
         }
     }
     pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {

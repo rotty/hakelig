@@ -27,7 +27,7 @@ use tendril::StrTendril;
 use tokio::runtime::current_thread;
 use url::Url;
 
-use crate::store::Store;
+use crate::store::{FoundUrl, Store};
 
 #[derive(Debug)]
 enum Extracted {
@@ -202,7 +202,7 @@ impl TokenSink for ExtractSink {
 pub fn extraction_thread(
     store: Arc<Store>,
     tasks: mpsc::Receiver<ExtractTask>,
-    url_sink: mpsc::UnboundedSender<Arc<Url>>,
+    url_sink: mpsc::UnboundedSender<FoundUrl>,
     state: super::QueueState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -229,18 +229,18 @@ pub fn extraction_thread(
 }
 
 pub struct ExtractTask {
-    url: Arc<Url>,
+    url: FoundUrl,
     chunk_source: mpsc::Receiver<Vec<u8>>,
 }
 
 impl ExtractTask {
-    pub fn new(url: Arc<Url>, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
+    pub fn new(url: FoundUrl, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
         ExtractTask { url, chunk_source }
     }
     async fn run(
         self,
         store: Arc<Store>,
-        url_sink: mpsc::UnboundedSender<Arc<Url>>,
+        url_sink: mpsc::UnboundedSender<FoundUrl>,
         state: super::QueueState,
     ) -> Result<(), ExtractError> {
         process_url(self.url, self.chunk_source, store, url_sink, state).await
@@ -248,32 +248,38 @@ impl ExtractTask {
 }
 
 async fn process_url(
-    task_url: Arc<Url>,
+    task_url: FoundUrl,
     mut chunk_source: mpsc::Receiver<Vec<u8>>,
     url_store: Arc<Store>,
-    mut url_sink: mpsc::UnboundedSender<Arc<Url>>,
+    mut url_sink: mpsc::UnboundedSender<FoundUrl>,
     queue_state: super::QueueState,
 ) -> Result<(), ExtractError> {
     queue_state.extraction_dequeued();
     let store = Arc::clone(&url_store);
-    let url = Arc::clone(&task_url);
-    let mut extractor = Extractor::new(Arc::clone(&task_url));
+    let FoundUrl(url, level) = task_url.clone();
+    let extracted_level = level + 1;
+    let mut extractor = Extractor::new(url.clone());
     let mut anchors = HashSet::new();
     while let Some(chunk) = chunk_source.next().await {
-        let task_url = Arc::clone(&task_url);
+        let task_url = Arc::clone(&url);
         match extractor.process_buf(chunk) {
             Ok(items) => {
                 for extracted in items {
                     let task_url = Arc::clone(&task_url);
                     match extracted {
                         Extracted::Link(link) => {
+                            if !store.recurse_level(extracted_level) {
+                                continue;
+                            }
                             if let Some(unknown_url) = store.add_link(Arc::clone(&task_url), link) {
                                 debug!(
                                     "submitting URL {}, extracted from {}",
                                     unknown_url, task_url
                                 );
                                 queue_state.url_enqueued();
-                                url_sink.send(unknown_url).await?;
+                                url_sink
+                                    .send(FoundUrl(unknown_url, extracted_level))
+                                    .await?;
                             }
                         }
                         Extracted::Anchor(anchor) => {

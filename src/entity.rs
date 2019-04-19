@@ -28,6 +28,8 @@ use std::{
 use tokio::{fs, io::AsyncReadExt};
 use url::Url;
 
+use crate::store::FoundUrl;
+
 pub struct Context {
     http_client: reqwest::Client,
 }
@@ -51,31 +53,37 @@ pub type EntityStream = BoxStream<'static, Result<Box<dyn Entity>, Error>>;
 pub type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 pub trait Entity: Send {
-    fn url(&self) -> Arc<Url>;
+    fn found_url(&self) -> &FoundUrl;
+    fn url(&self) -> Arc<Url> {
+        self.found_url().0.clone()
+    }
+    fn level(&self) -> u32 {
+        self.found_url().1
+    }
     fn read_chunks(&self, ctx: &Context) -> ChunkStream;
 }
 
 #[derive(Clone)]
 struct HtmlPath {
     path: Box<Path>,
-    url: Arc<Url>,
+    url: FoundUrl,
 }
 
 impl HtmlPath {
-    fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    fn new<P: AsRef<Path>>(path: P, level: u32) -> io::Result<Self> {
         let mut abs_path = std::env::current_dir()?;
         abs_path.push(path);
         let url = Url::from_file_path(&abs_path).expect("unrepresentable path");
         Ok(HtmlPath {
             path: abs_path.into(),
-            url: Arc::new(url),
+            url: FoundUrl(Arc::new(url), level),
         })
     }
 }
 
 impl Entity for HtmlPath {
-    fn url(&self) -> Arc<Url> {
-        self.url.clone()
+    fn found_url(&self) -> &FoundUrl {
+        &self.url
     }
     fn read_chunks(&self, _: &Context) -> ChunkStream {
         Box::pin(read_html_file(self.path.clone()).try_flatten_stream())
@@ -107,24 +115,24 @@ async fn read_html_file(path: Box<Path>) -> Result<ChunkStream, io::Error> {
 
 #[derive(Clone)]
 struct HttpUrl {
-    url: Arc<Url>,
+    url: FoundUrl,
 }
 
 impl HttpUrl {
-    fn new(url: Arc<Url>) -> Self {
+    fn new(url: FoundUrl) -> Self {
         HttpUrl { url }
     }
 }
 
 impl Entity for HttpUrl {
-    fn url(&self) -> Arc<Url> {
-        Arc::clone(&self.url)
+    fn found_url(&self) -> &FoundUrl {
+        &self.url
     }
     fn read_chunks(&self, ctx: &Context) -> ChunkStream {
         // TODO: use dedicated error type
         // TODO: record redirects (use custom RedirectPolicy)
         let chunks = ctx
-            .http_get(self.url.as_ref())
+            .http_get(self.url.0.as_ref())
             .and_then(|response| {
                 async move {
                     let response = response.error_for_status()?;
@@ -156,7 +164,7 @@ impl Entity for HttpUrl {
     }
 }
 
-pub fn classify_path(path: &Path) -> Result<Box<dyn Entity>, Error> {
+pub fn classify_path(path: &Path, level: u32) -> Result<Box<dyn Entity>, Error> {
     let ext = match path.extension() {
         Some(ext) => match ext.to_str() {
             Some(ext) => ext,
@@ -170,7 +178,7 @@ pub fn classify_path(path: &Path) -> Result<Box<dyn Entity>, Error> {
         None => return Err(format_err!("path without extension: {}", path.display())),
     };
     match ext {
-        "html" | "htm" => match HtmlPath::new(&path) {
+        "html" | "htm" => match HtmlPath::new(&path, level) {
             Ok(entity) => Ok(Box::new(entity) as Box<dyn Entity>),
             Err(_) => Err(format_err!(
                 "could not represent filename {} as an URL",
@@ -185,13 +193,14 @@ pub fn classify_path(path: &Path) -> Result<Box<dyn Entity>, Error> {
     }
 }
 
-pub fn classify_url(url: &Url) -> Result<Box<dyn Entity>, Error> {
-    match url.scheme() {
+pub fn classify_url(url: FoundUrl) -> Result<Box<dyn Entity>, Error> {
+    match url.0.scheme() {
         "file" => url
+            .0
             .to_file_path()
             .map_err(|_| format_err!("could not construct file path from URL {}", url))
-            .and_then(|path| classify_path(&path)),
-        "http" | "https" => Ok(Box::new(HttpUrl::new(Arc::new(url.clone())))),
+            .and_then(|path| classify_path(&path, url.1)),
+        "http" | "https" => Ok(Box::new(HttpUrl::new(url))),
         _ => Err(format_err!("unsupported URL: {}", url)),
     }
 }
@@ -249,16 +258,16 @@ where
                             .map_err(|_| {
                                 format_err!("could not construct file path from URL {}", url)
                             })
-                            .map(list_path)
+                            .map(|path| list_path(path, 0))
                     } else {
-                        classify_url(&url)
+                        classify_url(FoundUrl::new(url))
                             .map(|entity| entity_stream(stream::once(async { Ok(entity) })))
                     }
                 }
                 Err(_) => {
                     // FIXME: expect
                     urls.push(LOCAL_BASE.join(&root).expect("cannot parse URL"));
-                    Ok(list_path(root.into()))
+                    Ok(list_path(root.into(), 0))
                 }
             }
         })
@@ -266,19 +275,22 @@ where
     Ok((urls, entity_stream(stream::select_all(streams))))
 }
 
-fn list_path(path: PathBuf) -> EntityStream {
+fn list_path(path: PathBuf, level: u32) -> EntityStream {
     let inner_path = path.clone();
     let stream = fs::metadata(path)
         .map_ok(move |metadata| {
             let path = inner_path;
             if metadata.file_type().is_dir() {
+                let level = level + 1;
                 entity_stream(
                     dir_lister(path, Arc::new(|_| true))
                         .err_into()
-                        .and_then(|p| async move { classify_path(&p) }),
+                        .and_then(move |p| async move { classify_path(&p, level) }),
                 )
             } else {
-                entity_stream(stream::once(async move { classify_path(path.as_ref()) }))
+                entity_stream(stream::once(
+                    async move { classify_path(path.as_ref(), level) },
+                ))
             }
         })
         .map_err(Error::from)

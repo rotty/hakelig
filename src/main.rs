@@ -35,13 +35,19 @@ mod store;
 
 use entity::{Entity, EntityStream};
 use extract::{extraction_thread, ExtractTask};
-use store::Store;
+use store::{FoundUrl, Store};
 
 #[derive(StructOpt)]
 struct Opt {
     roots: Vec<String>,
     #[structopt(long = "link-ignore", number_of_values = 1)]
     link_ignore: Vec<String>,
+    #[structopt(
+        short = "r",
+        long = "recursion-limit",
+        help = "Maximum number of recursions, set to negative to disable limit"
+    )]
+    recursion_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,8 +105,8 @@ struct App {
     // TODO: get rid of `Option` here
     task_source: Option<mpsc::Receiver<ExtractTask>>,
     root_stream: Option<EntityStream>,
-    found_source: Option<mpsc::UnboundedReceiver<Arc<Url>>>,
-    found_sink: mpsc::UnboundedSender<Arc<Url>>,
+    found_source: Option<mpsc::UnboundedReceiver<FoundUrl>>,
+    found_sink: mpsc::UnboundedSender<FoundUrl>,
     store: Arc<Store>,
     queue_state: QueueState,
 }
@@ -155,6 +161,7 @@ where
             continue;
         }
         let url = entity.url();
+        let found_url = entity.found_url().clone();
         debug!("queuing task for {}", &url);
         backend.queue_state.extraction_enqueued();
         backend.queue_state.url_dequeued();
@@ -163,7 +170,7 @@ where
         debug!("queued {}", url);
         match backend
             .task_sink
-            .send(ExtractTask::new(Arc::clone(&url), chunk_source))
+            .send(ExtractTask::new(found_url, chunk_source))
             .await
         {
             Ok(_) => {}
@@ -186,7 +193,11 @@ impl App {
             url.set_query(None);
             url.path_segments_mut().expect("cannot-be-base URL").pop();
         }
-        let store = Arc::new(Store::new(link_ignore_set, Some(root_urls)));
+        let store = Arc::new(Store::new(
+            link_ignore_set,
+            Some(root_urls),
+            opt.recursion_limit,
+        ));
         let (found_sink, found_source) = mpsc::unbounded();
         let (task_sink, task_source) = mpsc::channel(10);
         let entity_ctx = Arc::new(entity::Context::new());
@@ -207,7 +218,7 @@ impl App {
         })
     }
 
-    fn submit_roots(&self, root_stream: EntityStream) -> impl Future<Output = ()> + 'static {
+    fn submit_roots(&self, root_stream: EntityStream) -> impl Future<Output = ()> + 'static + Send {
         let root_enqueue_state = self.queue_state.clone();
         let roots = root_stream.map_ok(move |entity| {
             root_enqueue_state.url_enqueued();
@@ -225,13 +236,13 @@ impl App {
         }
     }
 
-    async fn submit_found(&self, found_source: mpsc::UnboundedReceiver<Arc<Url>>) {
+    async fn submit_found(&self, found_source: mpsc::UnboundedReceiver<FoundUrl>) {
         let found_state = self.queue_state.clone();
         let backend = self.backend.clone();
         let found = found_source.filter_map(move |url| {
             let found_state = found_state.clone();
             async move {
-                match entity::classify_url(&url) {
+                match entity::classify_url(url) {
                     Err(_) => {
                         // TODO: do not swallow error
                         found_state.url_dequeued();
