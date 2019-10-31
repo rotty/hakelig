@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use failure::Error;
 use futures::{future, stream, Future, Stream};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use reqwest::r#async as rq;
 use std::io;
 use tokio::fs;
@@ -188,9 +188,7 @@ where
     Box::new(entries.flatten())
 }
 
-lazy_static! {
-    static ref LOCAL_BASE: Url = Url::parse("file:///").unwrap();
-}
+static LOCAL_BASE: Lazy<Url> = Lazy::new(|| Url::parse("file:///").unwrap());
 
 fn entity_stream<S>(stream: S) -> EntityStream
 where

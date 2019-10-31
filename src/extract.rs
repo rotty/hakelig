@@ -24,8 +24,8 @@ use html5ever::tokenizer::{
     BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult,
 };
 use html5ever::Attribute;
-use lazy_static::lazy_static;
 use log::debug;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use tendril::StrTendril;
 use tokio::runtime::current_thread;
@@ -144,9 +144,8 @@ struct ExtractSink {
 
 struct Redirect(Url);
 
-lazy_static! {
-    static ref CONTENT_REDIRECT_RE: Regex = Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap();
-}
+static CONTENT_REDIRECT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap());
 
 /// Checks for a `http-equiv=refresh` attribute and returns the URL inside the
 /// `content` attribute, if present.
