@@ -13,13 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::HashSet;
-use std::fmt;
-use std::str;
-use std::sync::Arc;
-use std::thread;
+use std::{collections::HashSet, fmt, str, sync::Arc, thread};
 
-use futures::{future, stream, Future, IntoFuture, Stream};
+use futures::{channel::mpsc, prelude::*};
 use html5ever::tokenizer::{
     BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult,
 };
@@ -29,7 +25,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use tendril::StrTendril;
 use tokio::runtime::current_thread;
-use tokio::sync::mpsc;
 use url::Url;
 
 use crate::store::Store;
@@ -40,30 +35,24 @@ enum Extracted {
     Anchor(Box<str>),
 }
 
+#[derive(Debug)]
 enum ExtractError {
     Finished,
     Redirect(Url),
-    UnboundedSend(mpsc::error::UnboundedSendError),
-    Recv(mpsc::error::RecvError),
-    Send(mpsc::error::SendError),
+    Recv(mpsc::TryRecvError),
+    Send(mpsc::SendError),
     Utf8(str::Utf8Error),
 }
 
-impl From<mpsc::error::RecvError> for ExtractError {
-    fn from(recv: mpsc::error::RecvError) -> Self {
+impl From<mpsc::TryRecvError> for ExtractError {
+    fn from(recv: mpsc::TryRecvError) -> Self {
         ExtractError::Recv(recv)
     }
 }
 
-impl From<mpsc::error::SendError> for ExtractError {
-    fn from(send: mpsc::error::SendError) -> Self {
+impl From<mpsc::SendError> for ExtractError {
+    fn from(send: mpsc::SendError) -> Self {
         ExtractError::Send(send)
-    }
-}
-
-impl From<mpsc::error::UnboundedSendError> for ExtractError {
-    fn from(send: mpsc::error::UnboundedSendError) -> Self {
-        ExtractError::UnboundedSend(send)
     }
 }
 
@@ -80,7 +69,6 @@ impl fmt::Display for ExtractError {
             ExtractError::Redirect(url) => write!(fmt, "redirect to {}", url),
             ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
             ExtractError::Send(e) => write!(fmt, "send failure: {}", e),
-            ExtractError::UnboundedSend(e) => write!(fmt, "unbounded send failure: {}", e),
             ExtractError::Utf8(e) => write!(fmt, "invalid UTF8: {}", e),
         }
     }
@@ -101,40 +89,36 @@ fn from_utf8_partial(input: &[u8]) -> Result<(&str, &[u8]), str::Utf8Error> {
     }
 }
 
-// We extract links by feeding chunks of data from a source channel into the
-// `html5ever` tokenizer, which is not `Send`. The reason to use a channel and
-// not an `AsyncRead` instance directly is that we want to use the tokio
-// threadpool runtime for the actual reading, so we can handle blocking disk
-// I/O, but cannot run the tokenizer inside the thread pool.
-fn extract(
-    base: Arc<Url>,
-    source: mpsc::Receiver<Vec<u8>>,
-) -> impl Stream<Item = Extracted, Error = ExtractError> {
-    let queue = BufferQueue::new();
-    let tokenizer = Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default());
-    iterate(
-        source.map_err(ExtractError::Recv),
-        (queue, tokenizer, vec![]),
-        |_| (),
-        |buf, (mut queue, mut tokenizer, mut remainder)| {
-            let (s, remainder) = if remainder.is_empty() {
-                from_utf8_partial(&buf)?
-            } else {
-                remainder.extend(&buf);
-                from_utf8_partial(&remainder)?
-            };
-            queue.push_back(StrTendril::from_slice(s));
-            if let TokenizerResult::Script(redirect) = tokenizer.feed(&mut queue) {
-                return Err(ExtractError::Redirect(redirect.0));
-            }
-            Ok((
-                tokenizer.sink.output.drain(0..).collect::<Vec<_>>(),
-                (queue, tokenizer, Vec::from(remainder)),
-            ))
-        },
-    )
-    .map(stream::iter_ok)
-    .flatten()
+struct Extractor {
+    buffer_queue: BufferQueue,
+    tokenizer: Tokenizer<ExtractSink>,
+    buf: Vec<u8>,
+}
+
+impl Extractor {
+    fn new(base: Arc<Url>) -> Self {
+        Extractor {
+            buffer_queue: BufferQueue::new(),
+            tokenizer: Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default()),
+            buf: Vec::new(),
+        }
+    }
+
+    fn process_buf(&mut self, buf: Vec<u8>) -> Result<Vec<Extracted>, ExtractError> {
+        let (s, remainder) = if self.buf.is_empty() {
+            from_utf8_partial(&buf)?
+        } else {
+            self.buf.extend(buf);
+            from_utf8_partial(&self.buf)?
+        };
+        self.buffer_queue.push_back(StrTendril::from_slice(s));
+        if let TokenizerResult::Script(redirect) = self.tokenizer.feed(&mut self.buffer_queue) {
+            Err(ExtractError::Redirect(redirect.0))
+        } else {
+            self.buf = Vec::from(remainder); // TODO: This could be more efficient
+            Ok(self.tokenizer.sink.output.drain(0..).collect::<Vec<_>>())
+        }
+    }
 }
 
 struct ExtractSink {
@@ -224,12 +208,19 @@ pub fn extraction_thread(
     state: super::QueueState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut runtime = current_thread::Runtime::new().unwrap();
         let extract = tasks
-            .map_err(ExtractError::Recv)
             .map(move |task| task.run(Arc::clone(&store), url_sink.clone(), state.clone()))
             .buffer_unordered(10)
-            .for_each(|_| Ok(()));
-        current_thread::block_on_all(extract).unwrap_or_else(|e| {
+            .try_for_each(|_| async { Ok(()) })
+            .map(|result| match result {
+                Err(ExtractError::Finished) | Ok(_) => {}
+                Err(e) => {
+                    eprintln!("error running extraction: {}", e);
+                }
+            });
+        runtime.spawn(extract);
+        runtime.run().unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
         });
         debug!("extraction thread terminating");
@@ -253,148 +244,76 @@ impl ExtractTask {
     pub fn sentinel() -> Self {
         ExtractTask(TaskInner::Sentinel)
     }
-    fn run(
+    async fn run(
         self,
         store: Arc<Store>,
         url_sink: mpsc::UnboundedSender<Arc<Url>>,
         state: super::QueueState,
-    ) -> impl Future<Item = (), Error = ExtractError> {
+    ) -> Result<(), ExtractError> {
         match self.0 {
             TaskInner::Sentinel => {
-                let process_sentinel = future::lazy(move || {
-                    if state.is_done() {
-                        return Err(ExtractError::Finished);
-                    }
-                    Ok(())
-                });
-                future::Either::A(process_sentinel)
+                if state.is_done() {
+                    return Err(ExtractError::Finished);
+                }
+                Ok(())
             }
             TaskInner::Process { url, chunk_source } => {
-                future::Either::B(process_url(url, chunk_source, store, url_sink, state))
+                process_url(url, chunk_source, store, url_sink, state).await
             }
         }
     }
 }
 
-fn process_url(
+async fn process_url(
     task_url: Arc<Url>,
-    chunk_source: mpsc::Receiver<Vec<u8>>,
+    mut chunk_source: mpsc::Receiver<Vec<u8>>,
     url_store: Arc<Store>,
-    url_sink: mpsc::UnboundedSender<Arc<Url>>,
+    mut url_sink: mpsc::UnboundedSender<Arc<Url>>,
     queue_state: super::QueueState,
-) -> impl Future<Item = (), Error = ExtractError> {
+) -> Result<(), ExtractError> {
     queue_state.extraction_dequeued();
     let store = Arc::clone(&url_store);
     let url = Arc::clone(&task_url);
-    let operations =
-        extract(Arc::clone(&url), chunk_source).filter_map(move |extracted| match extracted {
-            Extracted::Link(link) => {
-                if let Some(unknown_url) = store.add_link(Arc::clone(&url), link) {
-                    Some(Operation::SinkUrl(unknown_url))
-                } else {
-                    None
-                }
-            }
-            Extracted::Anchor(anchor) => Some(Operation::AddAnchor(anchor)),
-        });
-    let url = Arc::clone(&task_url);
-    let store = Arc::clone(&url_store);
-    let found_urls = iterate(
-        operations,
-        HashSet::new(),
-        move |anchors| {
-            store
-                .resolve(Arc::clone(&url), anchors)
-                .unwrap_or_else(|e| eprintln!("could not resolve {}: {}", url, e));
-        },
-        |op, mut anchors| match op {
-            Operation::AddAnchor(anchor) => {
-                anchors.insert(anchor);
-                Ok((None, anchors))
-            }
-            Operation::SinkUrl(url) => Ok((Some(url), anchors)),
-        },
-    )
-    .filter_map(|item| item);
-
-    let url = Arc::clone(&task_url);
-    let state = queue_state.clone();
-    let found_debug = found_urls.map(move |item| {
-        debug!("submitting URL {}, extracted from {}", &item, &url);
-        state.url_enqueued(); // TODO: is this really _sure_?
-        item
-    });
-    let url = Arc::clone(&task_url);
-    let state = queue_state;
-    let store = Arc::clone(&url_store);
-    found_debug
-        .forward(url_sink)
-        .map(move |_url_sink| ())
-        .then(move |result| {
-            debug!("extraction for {} done ({:?})", url, state);
-            state.extraction_done();
-            if state.is_done() {
-                return Err(ExtractError::Finished);
-            }
-            result
-        })
-        .or_else(move |e| {
-            match e {
-                ExtractError::Utf8(e) => eprintln!("could not parse {}: {}", task_url, e),
-                ExtractError::Redirect(url) => {
-                    store.add_redirect(task_url, Arc::new(url));
-                }
-                _ => return Err(e),
-            }
-            Ok(())
-        })
-}
-
-#[derive(Debug)]
-enum Operation {
-    SinkUrl(Arc<Url>),
-    AddAnchor(Box<str>),
-}
-
-// This is in some ways a mashup between `stream::unfold` and `Stream::fold`. It
-// threads a seed through some computation `step`, and when the stream is
-// exhausted, it calls `finish` on the final seed value.
-fn iterate<S, T, U, F, Fut, It>(
-    stream: S,
-    init: T,
-    finish: U,
-    step: F,
-) -> impl Stream<Item = It, Error = Fut::Error>
-where
-    S: Stream<Error = Fut::Error>,
-    U: FnOnce(T) -> (),
-    F: FnMut(S::Item, T) -> Fut,
-    Fut: IntoFuture<Item = (It, T)>,
-{
-    stream::unfold(
-        (stream, init, step, finish, false),
-        move |(s, seed, mut step, finish, eof)| {
-            if eof {
-                finish(seed);
-                None
-            } else {
-                let next = s
-                    .into_future()
-                    .map_err(|(e, _)| e)
-                    .and_then(move |(item, rest)| {
-                        if let Some(element) = item {
-                            future::Either::A(step(element, seed).into_future().map(
-                                |(element, seed)| {
-                                    (Some(element), (rest, seed, step, finish, false))
-                                },
-                            ))
-                        } else {
-                            future::Either::B(future::ok((None, (rest, seed, step, finish, true))))
+    let mut extractor = Extractor::new(Arc::clone(&task_url));
+    let mut anchors = HashSet::new();
+    while let Some(chunk) = chunk_source.next().await {
+        let task_url = Arc::clone(&task_url);
+        match extractor.process_buf(chunk) {
+            Ok(items) => {
+                for extracted in items {
+                    let task_url = Arc::clone(&task_url);
+                    match extracted {
+                        Extracted::Link(link) => {
+                            if let Some(unknown_url) = store.add_link(Arc::clone(&task_url), link) {
+                                debug!(
+                                    "submitting URL {}, extracted from {}",
+                                    unknown_url, task_url
+                                );
+                                queue_state.url_enqueued();
+                                url_sink.send(unknown_url).await?;
+                            }
                         }
-                    });
-                Some(next)
+                        Extracted::Anchor(anchor) => {
+                            anchors.insert(anchor);
+                        }
+                    }
+                }
             }
-        },
-    )
-    .filter_map(|item| item)
+            Err(ExtractError::Utf8(e)) => eprintln!("could not parse {}: {}", task_url, e),
+            Err(ExtractError::Redirect(url)) => {
+                store.add_redirect(task_url, Arc::new(url));
+            }
+            Err(e) => return Err(e), // TODO: return different error type
+        }
+    }
+    if let Err(e) = store.resolve(Arc::clone(&url), anchors) {
+        eprintln!("could not resolve {}: {}", url, e);
+    }
+    debug!("extraction for {} done ({:?})", url, queue_state);
+    queue_state.extraction_done();
+    if queue_state.is_done() {
+        url_sink.close_channel();
+        return Err(ExtractError::Finished);
+    }
+    Ok(())
 }

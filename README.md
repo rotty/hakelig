@@ -7,6 +7,10 @@ use, but for interested developers.
 The first milestone will be to make it useable for quickly checking
 documentation emitted by `cargo doc` to the local filesystem.
 
+Note that the code has been adapted to make use of the async/await
+feature to be shipped with Rust 1.39, so you'll need a beta toolchain
+to compile `hakelig` at the time of writing.
+
 ## What works
 
 - Local, recursive link checking for HTML documents, using the

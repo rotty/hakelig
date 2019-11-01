@@ -13,35 +13,42 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use failure::Error;
-use futures::{future, stream, Future, Stream};
+use failure::{format_err, Error};
+use futures::{
+    prelude::*,
+    stream::{self, BoxStream},
+    Stream,
+};
 use once_cell::sync::Lazy;
-use reqwest::r#async as rq;
 use std::io;
-use tokio::fs;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{fs, io::AsyncReadExt};
 use url::Url;
 
 pub struct Context {
-    http_client: rq::Client,
+    http_client: reqwest::Client,
 }
 
 impl Context {
     pub fn new() -> Self {
         Context {
-            http_client: rq::Client::new(),
+            http_client: reqwest::Client::new(),
         }
     }
-    pub fn http_get(&self, url: &Url) -> impl Future<Item = rq::Response, Error = reqwest::Error> {
+    pub fn http_get(
+        &self,
+        url: &Url,
+    ) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>> {
         self.http_client.get(url.clone()).send()
     }
 }
 
-pub type EntityStream = Box<dyn Stream<Item = Box<dyn Entity>, Error = Error> + Send>;
+pub type EntityStream = BoxStream<'static, Result<Box<dyn Entity>, Error>>;
 
-type ChunkStream = Box<dyn Stream<Item = Vec<u8>, Error = io::Error> + Send>;
+type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 pub trait Entity: Send {
     fn url(&self) -> Arc<Url>;
@@ -71,27 +78,31 @@ impl Entity for HtmlPath {
         self.url.clone()
     }
     fn read_chunks(&self, _: &Context) -> ChunkStream {
-        let buf = vec![0u8; 4096];
-        let links = fs::File::open(self.path.clone())
-            .map(|file| {
-                stream::unfold((file, buf, false), |(file, buf, eof)| {
-                    if eof {
-                        None
-                    } else {
-                        let read = tokio::io::read(file, buf).map(|(file, buf, n_read)| {
-                            if n_read == 0 {
-                                (Vec::new(), (file, buf, true))
-                            } else {
-                                (Vec::from(&buf[..n_read]), (file, buf, false))
-                            }
-                        });
-                        Some(read)
-                    }
-                })
-            })
-            .flatten_stream();
-        Box::new(links)
+        Box::pin(read_html_file(self.path.clone()).try_flatten_stream())
     }
+}
+
+async fn read_html_file(path: Box<Path>) -> Result<ChunkStream, io::Error> {
+    let buf = vec![0u8; 4096];
+    let file = fs::File::open(path).await?;
+    let read_chunks = stream::unfold((buf, file, false), move |(mut buf, mut file, eof)| {
+        async move {
+            if eof {
+                None
+            } else {
+                let n_read = match file.read(&mut buf).await {
+                    Ok(n_read) => n_read,
+                    Err(e) => return Some((Err(e), (buf, file, true))),
+                };
+                if n_read == 0 {
+                    Some((Ok(Vec::new()), (buf, file, true)))
+                } else {
+                    Some((Ok(Vec::from(&buf[..n_read])), (buf, file, false)))
+                }
+            }
+        }
+    });
+    Ok(Box::pin(read_chunks) as ChunkStream)
 }
 
 #[derive(Clone)]
@@ -114,139 +125,163 @@ impl Entity for HttpUrl {
         // TODO: record redirects (use custom RedirectPolicy)
         let chunks = ctx
             .http_get(self.url.as_ref())
-            .and_then(|response| response.error_for_status())
-            .map(|response| {
-                response
-                    .into_body()
-                    .map(|chunk| Vec::from(chunk.as_ref()))
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("reading HTTP response failed: {}", e),
-                        )
-                    })
+            .and_then(|response| {
+                async move {
+                    let response = response.error_for_status()?;
+                    // TODO: would be nice if `reqwest` provided a `chunks`
+                    // method returning a stream.
+                    Ok(stream::unfold(response, move |mut response| {
+                        async move {
+                            match response.chunk().await {
+                                // TODO: probably should use `Bytes` ourselves to avoid copying here
+                                Ok(Some(chunk)) => Some((Ok(Vec::from(&chunk[..])), response)),
+                                Ok(None) => None,
+                                Err(e) => Some((
+                                    Err(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        format!("reading HTTP response failed: {}", e),
+                                    )),
+                                    response,
+                                )),
+                            }
+                        }
+                    }))
+                }
             })
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("HTTP request failed: {}", e))
             })
-            .flatten_stream();
-        Box::new(chunks)
+            .try_flatten_stream();
+        Box::pin(chunks)
     }
 }
 
-pub fn classify_path(path: &Path) -> Option<Box<dyn Entity>> {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(|ext| match ext {
-            "html" | "htm" => match HtmlPath::new(&path) {
-                Ok(entity) => Some(Box::new(entity) as Box<dyn Entity>),
-                Err(_) => {
-                    eprintln!("could not represent filename {} as an URL", path.display());
-                    None
-                }
-            },
-            _ => None,
-        })
+pub fn classify_path(path: &Path) -> Result<Box<dyn Entity>, Error> {
+    let ext = match path.extension() {
+        Some(ext) => match ext.to_str() {
+            Some(ext) => ext,
+            None => {
+                return Err(format_err!(
+                    "path with invalid extension: {}",
+                    path.display()
+                ))
+            }
+        },
+        None => return Err(format_err!("path without extension: {}", path.display())),
+    };
+    match ext {
+        "html" | "htm" => match HtmlPath::new(&path) {
+            Ok(entity) => Ok(Box::new(entity) as Box<dyn Entity>),
+            Err(_) => Err(format_err!(
+                "could not represent filename {} as an URL",
+                path.display()
+            )),
+        },
+        _ => Err(format_err!(
+            "path with unknown extension {}: {}",
+            ext,
+            path.display()
+        )),
+    }
 }
 
-pub fn classify_url(url: &Url) -> Option<Box<dyn Entity>> {
+pub fn classify_url(url: &Url) -> Result<Box<dyn Entity>, Error> {
     match url.scheme() {
         "file" => url
             .to_file_path()
-            .map_err(|_| {
-                eprintln!("could not construct file path from URL {}", url);
-            })
-            .ok()
+            .map_err(|_| format_err!("could not construct file path from URL {}", url))
             .and_then(|path| classify_path(&path)),
-        "http" | "https" => Some(Box::new(HttpUrl::new(Arc::new(url.clone())))),
-        _ => None,
+        "http" | "https" => Ok(Box::new(HttpUrl::new(Arc::new(url.clone())))),
+        _ => Err(format_err!("unsupported URL: {}", url)),
     }
 }
 
-type PathStream = Box<dyn Stream<Item = Box<Path>, Error = io::Error> + Send>;
+type PathStream = BoxStream<'static, Result<Box<Path>, io::Error>>;
 
 fn dir_lister<P>(path: P, predicate: Arc<dyn Fn(&Path) -> bool + Send + Sync>) -> PathStream
 where
     P: AsRef<Path> + Send + Sync + 'static,
 {
-    let entries = fs::read_dir(path).flatten_stream().map(move |entry| {
-        let path = entry.path();
-        let predicate = predicate.clone();
-        future::poll_fn(move || entry.poll_file_type())
-            .and_then(move |ft| {
+    let entries = fs::read_dir(path)
+        .try_flatten_stream()
+        .and_then(move |entry| {
+            let predicate = predicate.clone();
+            async move {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
                 let entries = if ft.is_dir() {
                     dir_lister(path, predicate)
                 } else if predicate(&path) {
-                    Box::new(stream::once(Ok(path.into_boxed_path()))) as PathStream
+                    Box::pin(stream::once(async { Ok(path.into_boxed_path()) })) as PathStream
                 } else {
-                    Box::new(stream::empty()) as PathStream
+                    Box::pin(stream::empty()) as PathStream
                 };
-                future::ok(entries)
-            })
-            .flatten_stream()
-    });
-    Box::new(entries.flatten())
+                Ok(entries)
+            }
+        });
+    Box::pin(entries.try_flatten())
 }
 
 static LOCAL_BASE: Lazy<Url> = Lazy::new(|| Url::parse("file:///").unwrap());
 
 fn entity_stream<S>(stream: S) -> EntityStream
 where
-    S: Stream<Item = Box<dyn Entity>, Error = Error> + Send + 'static,
+    S: Stream<Item = Result<Box<dyn Entity>, Error>> + Send + 'static,
 {
-    Box::new(stream)
+    Box::pin(stream)
 }
 
-pub fn list_roots<I>(roots: I) -> (Vec<Url>, EntityStream)
+pub fn list_roots<I>(roots: I) -> Result<(Vec<Url>, EntityStream), Error>
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
     let mut urls = Vec::new();
-    let stream = roots
+    let streams = roots
         .into_iter()
-        .fold(entity_stream(stream::empty()), |stream, root| {
+        .map(|root| {
             let root = root.as_ref().to_string();
             match Url::parse(&root) {
                 Ok(url) => {
                     urls.push(url.clone());
                     if url.scheme() == "file" {
-                        match url.to_file_path() {
-                            Ok(path) => entity_stream(stream.chain(list_path(path))),
-                            Err(_) => stream,
-                        }
+                        url.to_file_path()
+                            .map_err(|_| {
+                                format_err!("could not construct file path from URL {}", url)
+                            })
+                            .map(list_path)
                     } else {
-                        match classify_url(&url) {
-                            Some(entity) => entity_stream(stream.chain(stream::once(Ok(entity)))),
-                            None => stream,
-                        }
+                        classify_url(&url)
+                            .map(|entity| entity_stream(stream::once(async { Ok(entity) })))
                     }
                 }
                 Err(_) => {
+                    // FIXME: expect
                     urls.push(LOCAL_BASE.join(&root).expect("cannot parse URL"));
-                    entity_stream(stream.chain(list_path(root.into())))
+                    Ok(list_path(root.into()))
                 }
             }
-        });
-    (urls, stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((urls, entity_stream(stream::select_all(streams))))
 }
 
 fn list_path(path: PathBuf) -> EntityStream {
     let inner_path = path.clone();
     let stream = fs::metadata(path)
-        .map(move |metadata| {
+        .map_ok(move |metadata| {
             let path = inner_path;
             if metadata.file_type().is_dir() {
                 entity_stream(
                     dir_lister(path, Arc::new(|_| true))
-                        .map_err(Error::from)
-                        .filter_map(|p| classify_path(&p)),
+                        .err_into()
+                        .and_then(|p| async move { classify_path(&p) }),
                 )
             } else {
-                entity_stream(stream::once(Ok(path)).filter_map(|p| classify_path(p.as_ref())))
+                entity_stream(stream::once(async move { classify_path(path.as_ref()) }))
             }
         })
         .map_err(Error::from)
-        .flatten_stream();
-    Box::new(stream)
+        .try_flatten_stream();
+    Box::pin(stream)
 }
