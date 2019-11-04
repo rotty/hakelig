@@ -37,8 +37,7 @@ enum Extracted {
 
 #[derive(Debug)]
 enum ExtractError {
-    Finished,
-    Redirect(Url),
+    Redirect(Url), // TODO: this is not really an error
     Recv(mpsc::TryRecvError),
     Send(mpsc::SendError),
     Utf8(str::Utf8Error),
@@ -65,7 +64,6 @@ impl From<str::Utf8Error> for ExtractError {
 impl fmt::Display for ExtractError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ExtractError::Finished => write!(fmt, "finished"),
             ExtractError::Redirect(url) => write!(fmt, "redirect to {}", url),
             ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
             ExtractError::Send(e) => write!(fmt, "send failure: {}", e),
@@ -209,16 +207,19 @@ pub fn extraction_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut runtime = current_thread::Runtime::new().unwrap();
-        let extract = tasks
-            .map(move |task| task.run(Arc::clone(&store), url_sink.clone(), state.clone()))
-            .buffer_unordered(10)
-            .try_for_each(|_| async { Ok(()) })
-            .map(|result| match result {
-                Err(ExtractError::Finished) | Ok(_) => {}
-                Err(e) => {
-                    eprintln!("error running extraction: {}", e);
+        let extract = tasks.for_each_concurrent(20, move |task| {
+            let store = store.clone();
+            let url_sink = url_sink.clone();
+            let state = state.clone();
+            async move {
+                match task.run(store, url_sink, state).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("error running extraction: {}", e);
+                    }
                 }
-            });
+            }
+        });
         runtime.spawn(extract);
         runtime.run().unwrap_or_else(|e| {
             eprintln!("error extracting links: {}", e);
@@ -227,22 +228,14 @@ pub fn extraction_thread(
     })
 }
 
-pub struct ExtractTask(TaskInner);
-
-enum TaskInner {
-    Sentinel,
-    Process {
-        url: Arc<Url>,
-        chunk_source: mpsc::Receiver<Vec<u8>>,
-    },
+pub struct ExtractTask {
+    url: Arc<Url>,
+    chunk_source: mpsc::Receiver<Vec<u8>>,
 }
 
 impl ExtractTask {
     pub fn new(url: Arc<Url>, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
-        ExtractTask(TaskInner::Process { url, chunk_source })
-    }
-    pub fn sentinel() -> Self {
-        ExtractTask(TaskInner::Sentinel)
+        ExtractTask { url, chunk_source }
     }
     async fn run(
         self,
@@ -250,17 +243,7 @@ impl ExtractTask {
         url_sink: mpsc::UnboundedSender<Arc<Url>>,
         state: super::QueueState,
     ) -> Result<(), ExtractError> {
-        match self.0 {
-            TaskInner::Sentinel => {
-                if state.is_done() {
-                    return Err(ExtractError::Finished);
-                }
-                Ok(())
-            }
-            TaskInner::Process { url, chunk_source } => {
-                process_url(url, chunk_source, store, url_sink, state).await
-            }
-        }
+        process_url(self.url, self.chunk_source, store, url_sink, state).await
     }
 }
 
@@ -313,7 +296,6 @@ async fn process_url(
     queue_state.extraction_done();
     if queue_state.is_done() {
         url_sink.close_channel();
-        return Err(ExtractError::Finished);
     }
     Ok(())
 }

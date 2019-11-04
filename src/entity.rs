@@ -48,7 +48,7 @@ impl Context {
 
 pub type EntityStream = BoxStream<'static, Result<Box<dyn Entity>, Error>>;
 
-type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
+pub type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 pub trait Entity: Send {
     fn url(&self) -> Arc<Url>;

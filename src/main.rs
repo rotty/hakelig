@@ -13,11 +13,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 use failure::Error;
 use futures::{channel::mpsc, prelude::*};
@@ -111,66 +113,67 @@ struct Backend {
     entity_ctx: Arc<entity::Context>,
 }
 
-impl Backend {
-    async fn submit_entities<S>(mut self, mut entities: S) -> u64
-    where
-        S: Stream<Item = Result<Box<dyn Entity>, Error>> + Send + 'static + Unpin,
-    {
-        let mut n_submitted = 0;
-        while let Some(entity) = entities.next().await {
-            let entity = match entity {
-                Ok(entity) => entity,
-                Err(e) => {
-                    // This is dubious, review naming and semantics
-                    //self.queue_state.url_dequeued();
-                    eprintln!("could not submit entity: {}", e);
-                    continue;
-                }
-            };
-            let url = entity.url();
-            debug!("dequeued {}", url);
-            if !self.store.touch(Arc::clone(&url)) {
-                self.queue_state.url_dequeued();
-                debug!("{} already in store", &url);
-                continue;
-            }
-            let mut chunks = entity.read_chunks(&self.entity_ctx);
-            let (mut chunk_sink, chunk_source) = mpsc::channel(100);
-            debug!("queuing task for {}", &url);
-            self.queue_state.extraction_enqueued();
-            self.queue_state.url_dequeued();
-            match self
-                .task_sink
-                .send(ExtractTask::new(Arc::clone(&url), chunk_source))
-                .await
-            {
+async fn submit_chunks(
+    url: Arc<Url>,
+    mut chunks: entity::ChunkStream,
+    mut chunk_sink: mpsc::Sender<Vec<u8>>,
+) {
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(chunk) => match chunk_sink.send(chunk).await {
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("error submitting task for {}: {}", url, e);
-                    continue;
+                    eprintln!("error submitting chunk for {}: {}", url, e);
+                    return;
                 }
+            },
+            Err(e) => {
+                eprintln!("error reading chunk for {}: {}", url, e);
+                return;
             }
-            debug!("queued {}", url);
-            n_submitted += 1;
-            // TODO: this serializes the processing of entities
-            while let Some(chunk) = chunks.next().await {
-                match chunk {
-                    Ok(chunk) => match chunk_sink.send(chunk).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("error submitting chunk for {}: {}", url, e);
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("error reading chunk for {}: {}", url, e);
-                        break;
-                    }
-                }
-            }
-            debug!("done sending chunks {}", url);
         }
-        n_submitted
+    }
+}
+
+async fn submit_entities<S>(mut backend: Backend, mut entities: S)
+where
+    S: Stream<Item = Result<Box<dyn Entity>, Error>> + Unpin,
+{
+    while let Some(entity) = entities.next().await {
+        let entity = match entity {
+            Ok(entity) => entity,
+            Err(e) => {
+                eprintln!("could not submit entity: {}", e);
+                continue;
+            }
+        };
+        let url = entity.url();
+        debug!("dequeued {}", url);
+        if !backend.store.touch(Arc::clone(&url)) {
+            backend.queue_state.url_dequeued();
+            debug!("{} already in store", &url);
+            continue;
+        }
+        let url = entity.url();
+        debug!("queuing task for {}", &url);
+        backend.queue_state.extraction_enqueued();
+        backend.queue_state.url_dequeued();
+        let chunks = entity.read_chunks(&backend.entity_ctx);
+        let (chunk_sink, chunk_source) = mpsc::channel(100);
+        debug!("queued {}", url);
+        match backend
+            .task_sink
+            .send(ExtractTask::new(Arc::clone(&url), chunk_source))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                backend.queue_state.extraction_dequeued();
+                eprintln!("error submitting task for {}: {}", url, e);
+                continue;
+            }
+        }
+        tokio::spawn(submit_chunks(Arc::clone(&url), chunks, chunk_sink));
     }
 }
 
@@ -212,21 +215,12 @@ impl App {
         });
         let roots_done_state = self.queue_state.clone();
         let backend = self.backend.clone();
-        let mut sentinel_sink = backend.task_sink.clone();
         let found_sink = self.found_sink.clone();
         async move {
-            let n_submitted = backend.submit_entities(roots).await;
+            submit_entities(backend, roots).await;
             roots_done_state.roots_done();
-            // TODO: probably don't need `n_submitted`
-            if n_submitted == 0 || roots_done_state.is_done() {
+            if roots_done_state.is_done() {
                 found_sink.close_channel();
-            }
-            debug!(
-                "submitting roots done: {} submitted {:?}",
-                n_submitted, roots_done_state
-            );
-            if let Err(e) = sentinel_sink.send(ExtractTask::sentinel()).await {
-                eprintln!("could not send root sentinel: {}", e);
             }
         }
     }
@@ -248,8 +242,12 @@ impl App {
             }
         });
         let found = Box::pin(found);
-        backend.submit_entities(found).await;
+        submit_entities(backend, found).await;
         debug!("processing new URLs is done");
+        if self.queue_state.is_done() {
+            let mut task_sink = self.backend.task_sink.clone();
+            task_sink.close_channel();
+        }
     }
 
     fn run(&mut self) -> Result<(), Error> {
