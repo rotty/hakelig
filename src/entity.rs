@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use failure::{format_err, Error};
+use anyhow::{anyhow, Error};
 use futures::{
     prelude::*,
     stream::{self, BoxStream},
@@ -168,24 +168,19 @@ pub fn classify_path(path: &Path, level: u32) -> Result<Box<dyn Entity>, Error> 
     let ext = match path.extension() {
         Some(ext) => match ext.to_str() {
             Some(ext) => ext,
-            None => {
-                return Err(format_err!(
-                    "path with invalid extension: {}",
-                    path.display()
-                ))
-            }
+            None => return Err(anyhow!("path with invalid extension: {}", path.display())),
         },
-        None => return Err(format_err!("path without extension: {}", path.display())),
+        None => return Err(anyhow!("path without extension: {}", path.display())),
     };
     match ext {
         "html" | "htm" => match HtmlPath::new(&path, level) {
             Ok(entity) => Ok(Box::new(entity) as Box<dyn Entity>),
-            Err(_) => Err(format_err!(
+            Err(_) => Err(anyhow!(
                 "could not represent filename {} as an URL",
                 path.display()
             )),
         },
-        _ => Err(format_err!(
+        _ => Err(anyhow!(
             "path with unknown extension {}: {}",
             ext,
             path.display()
@@ -198,10 +193,10 @@ pub fn classify_url(url: FoundUrl) -> Result<Box<dyn Entity>, Error> {
         "file" => url
             .0
             .to_file_path()
-            .map_err(|_| format_err!("could not construct file path from URL {}", url))
+            .map_err(|_| anyhow!("could not construct file path from URL {}", url))
             .and_then(|path| classify_path(&path, url.1)),
         "http" | "https" => Ok(Box::new(HttpUrl::new(url))),
-        _ => Err(format_err!("unsupported URL: {}", url)),
+        _ => Err(anyhow!("unsupported URL: {}", url)),
     }
 }
 
@@ -255,9 +250,7 @@ where
                     urls.push(url.clone());
                     if url.scheme() == "file" {
                         url.to_file_path()
-                            .map_err(|_| {
-                                format_err!("could not construct file path from URL {}", url)
-                            })
+                            .map_err(|_| anyhow!("could not construct file path from URL {}", url))
                             .map(|path| list_path(path, 0))
                     } else {
                         classify_url(FoundUrl::new(url))

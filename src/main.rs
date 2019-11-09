@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use failure::Error;
+use anyhow::Error;
 use futures::{channel::mpsc, prelude::*};
 use log::debug;
 use regex::RegexSet;
