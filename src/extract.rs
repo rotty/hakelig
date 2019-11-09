@@ -238,70 +238,61 @@ impl ExtractTask {
         ExtractTask { url, chunk_source }
     }
     async fn run(
-        self,
+        mut self,
         store: Arc<Store>,
-        url_sink: mpsc::UnboundedSender<FoundUrl>,
+        mut url_sink: mpsc::UnboundedSender<FoundUrl>,
         state: super::QueueState,
     ) -> Result<(), ExtractError> {
-        process_url(self.url, self.chunk_source, store, url_sink, state).await
-    }
-}
-
-async fn process_url(
-    task_url: FoundUrl,
-    mut chunk_source: mpsc::Receiver<Vec<u8>>,
-    url_store: Arc<Store>,
-    mut url_sink: mpsc::UnboundedSender<FoundUrl>,
-    queue_state: super::QueueState,
-) -> Result<(), ExtractError> {
-    queue_state.extraction_dequeued();
-    let store = Arc::clone(&url_store);
-    let FoundUrl(url, level) = task_url.clone();
-    let extracted_level = level + 1;
-    let mut extractor = Extractor::new(url.clone());
-    let mut anchors = HashSet::new();
-    while let Some(chunk) = chunk_source.next().await {
-        let task_url = Arc::clone(&url);
-        match extractor.process_buf(chunk) {
-            Ok(items) => {
-                for extracted in items {
-                    let task_url = Arc::clone(&task_url);
-                    match extracted {
-                        Extracted::Link(link) => {
-                            if !store.recurse_level(extracted_level) {
-                                continue;
+        state.extraction_dequeued();
+        let FoundUrl(url, level) = self.url.clone();
+        let extracted_level = level + 1;
+        let mut extractor = Extractor::new(url.clone());
+        let mut anchors = HashSet::new();
+        while let Some(chunk) = self.chunk_source.next().await {
+            let task_url = Arc::clone(&url);
+            match extractor.process_buf(chunk) {
+                Ok(items) => {
+                    for extracted in items {
+                        let task_url = Arc::clone(&task_url);
+                        match extracted {
+                            Extracted::Link(link) => {
+                                if !store.recurse_level(extracted_level) {
+                                    continue;
+                                }
+                                if let Some(unknown_url) =
+                                    store.add_link(Arc::clone(&task_url), link)
+                                {
+                                    debug!(
+                                        "submitting URL {}, extracted from {}",
+                                        unknown_url, task_url
+                                    );
+                                    state.url_enqueued();
+                                    url_sink
+                                        .send(FoundUrl(unknown_url, extracted_level))
+                                        .await?;
+                                }
                             }
-                            if let Some(unknown_url) = store.add_link(Arc::clone(&task_url), link) {
-                                debug!(
-                                    "submitting URL {}, extracted from {}",
-                                    unknown_url, task_url
-                                );
-                                queue_state.url_enqueued();
-                                url_sink
-                                    .send(FoundUrl(unknown_url, extracted_level))
-                                    .await?;
+                            Extracted::Anchor(anchor) => {
+                                anchors.insert(anchor);
                             }
-                        }
-                        Extracted::Anchor(anchor) => {
-                            anchors.insert(anchor);
                         }
                     }
                 }
+                Err(ExtractError::Utf8(e)) => eprintln!("could not parse {}: {}", task_url, e),
+                Err(ExtractError::Redirect(url)) => {
+                    store.add_redirect(task_url, Arc::new(url));
+                }
+                Err(e) => return Err(e), // TODO: return different error type
             }
-            Err(ExtractError::Utf8(e)) => eprintln!("could not parse {}: {}", task_url, e),
-            Err(ExtractError::Redirect(url)) => {
-                store.add_redirect(task_url, Arc::new(url));
-            }
-            Err(e) => return Err(e), // TODO: return different error type
         }
+        if let Err(e) = store.resolve(Arc::clone(&url), anchors) {
+            eprintln!("could not resolve {}: {}", url, e);
+        }
+        debug!("extraction for {} done ({:?})", url, state);
+        state.extraction_done();
+        if state.is_done() {
+            url_sink.close_channel();
+        }
+        Ok(())
     }
-    if let Err(e) = store.resolve(Arc::clone(&url), anchors) {
-        eprintln!("could not resolve {}: {}", url, e);
-    }
-    debug!("extraction for {} done ({:?})", url, queue_state);
-    queue_state.extraction_done();
-    if queue_state.is_done() {
-        url_sink.close_channel();
-    }
-    Ok(())
 }
