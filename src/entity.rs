@@ -13,13 +13,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, bail, Error};
 use futures::{
+    future::BoxFuture,
     prelude::*,
     stream::{self, BoxStream},
     Stream,
 };
+use mime::Mime;
 use once_cell::sync::Lazy;
+use reqwest::header;
 use std::io;
 use std::{
     path::{Path, PathBuf},
@@ -49,8 +52,8 @@ impl Context {
 }
 
 pub type EntityStream = BoxStream<'static, Result<Box<dyn Entity>, Error>>;
-
 pub type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
+pub type ReadFuture = BoxFuture<'static, Result<(Mime, ChunkStream), Error>>;
 
 pub trait Entity: Send {
     fn found_url(&self) -> &FoundUrl;
@@ -60,7 +63,7 @@ pub trait Entity: Send {
     fn level(&self) -> u32 {
         self.found_url().1
     }
-    fn read_chunks(&self, ctx: &Context) -> ChunkStream;
+    fn read(&self, ctx: &Context) -> ReadFuture;
 }
 
 #[derive(Clone)]
@@ -85,8 +88,9 @@ impl Entity for HtmlPath {
     fn found_url(&self) -> &FoundUrl {
         &self.url
     }
-    fn read_chunks(&self, _: &Context) -> ChunkStream {
-        Box::pin(read_html_file(self.path.clone()).try_flatten_stream())
+    fn read(&self, _: &Context) -> ReadFuture {
+        let read = read_html_file(self.path.clone());
+        Box::pin(read.err_into().map_ok(|chunks| (mime::TEXT_HTML, chunks)))
     }
 }
 
@@ -128,39 +132,55 @@ impl Entity for HttpUrl {
     fn found_url(&self) -> &FoundUrl {
         &self.url
     }
-    fn read_chunks(&self, ctx: &Context) -> ChunkStream {
+    fn read(&self, ctx: &Context) -> ReadFuture {
         // TODO: use dedicated error type
         // TODO: record redirects (use custom RedirectPolicy)
-        let chunks = ctx
-            .http_get(self.url.0.as_ref())
-            .and_then(|response| {
-                async move {
-                    let response = response.error_for_status()?;
-                    // TODO: would be nice if `reqwest` provided a `chunks`
-                    // method returning a stream.
-                    Ok(stream::unfold(response, move |mut response| {
-                        async move {
-                            match response.chunk().await {
-                                // TODO: probably should use `Bytes` ourselves to avoid copying here
-                                Ok(Some(chunk)) => Some((Ok(Vec::from(&chunk[..])), response)),
-                                Ok(None) => None,
-                                Err(e) => Some((
-                                    Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("reading HTTP response failed: {}", e),
-                                    )),
-                                    response,
+        let FoundUrl(url, _) = self.url.clone();
+        let read = ctx.http_get(&url).err_into().and_then(|response| {
+            async move {
+                let response = response.error_for_status()?;
+                let mime = if let Some(content_type) = response.headers().get(header::CONTENT_TYPE)
+                {
+                    content_type.to_str()?.parse()?
+                } else if let Some(name) = url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                {
+                    // TODO: consolidate this logic with `classify_path`
+                    let ext = name.split('.').next_back().ok_or_else(|| {
+                        anyhow!(
+                            "non content header, and no file extension, cannot determine MIME type"
+                        )
+                    })?;
+                    match ext {
+                        "html" | "htm" => mime::TEXT_HTML,
+                        _ => bail!("unsupported MIME type {}", name),
+                    }
+                } else {
+                    bail!("unable to detect MIME type");
+                };
+                let chunks = stream::unfold(response, move |mut response| {
+                    async move {
+                        match response.chunk().await {
+                            // TODO: probably should use `Bytes` ourselves to avoid copying here
+                            Ok(Some(chunk)) => Some((Ok(Vec::from(&chunk[..])), response)),
+                            Ok(None) => None,
+                            Err(e) => Some((
+                                Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("reading HTTP response failed: {}", e),
                                 )),
-                            }
+                                response,
+                            )),
                         }
-                    }))
-                }
-            })
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("HTTP request failed: {}", e))
-            })
-            .try_flatten_stream();
-        Box::pin(chunks)
+                    }
+                });
+                // TODO: would be nice if `reqwest` provided a `chunks`
+                // method returning a stream.
+                Ok((mime, Box::pin(chunks) as ChunkStream))
+            }
+        });
+        Box::pin(read)
     }
 }
 

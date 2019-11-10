@@ -108,14 +108,46 @@ where
         if !backend.store.touch(Arc::clone(&url)) {
             backend.queue_state.url_dequeued();
             debug!("{} already in store", &url);
+            if backend.queue_state.is_done() {
+                break;
+            }
             continue;
         }
         let url = entity.url();
         let found_url = entity.found_url().clone();
         debug!("queuing task for {}", &url);
+        // We need to increment the `enqueued` counter first, so that we avoid
+        // getting into the `done` state prematurely.
         backend.queue_state.extraction_enqueued();
         backend.queue_state.url_dequeued();
-        let chunks = entity.read_chunks(&backend.entity_ctx);
+        let read = entity.read(&backend.entity_ctx);
+        let chunks = match read.await {
+            Ok((mime, chunks)) => {
+                match (mime.type_(), mime.subtype()) {
+                    (mime::TEXT, mime::HTML) => {}
+                    _ => {
+                        backend.queue_state.extraction_cancelled();
+                        debug!(
+                            "{}: ignoring non-HTML entity (MIME type {})",
+                            found_url, mime
+                        );
+                        if backend.queue_state.is_done() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                chunks
+            }
+            Err(e) => {
+                eprintln!("failed to read from {}: {}", found_url, e);
+                backend.queue_state.extraction_cancelled();
+                if backend.queue_state.is_done() {
+                    break;
+                }
+                continue;
+            }
+        };
         let (chunk_sink, chunk_source) = mpsc::channel(100);
         debug!("queued {}", url);
         match backend
@@ -125,8 +157,11 @@ where
         {
             Ok(_) => {}
             Err(e) => {
-                backend.queue_state.extraction_dequeued();
+                backend.queue_state.extraction_cancelled();
                 eprintln!("error submitting task for {}: {}", url, e);
+                if backend.queue_state.is_done() {
+                    break;
+                }
                 continue;
             }
         }

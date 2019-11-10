@@ -282,7 +282,10 @@ impl ExtractTask {
                 Err(ExtractError::Redirect(url)) => {
                     store.add_redirect(task_url, Arc::new(url));
                 }
-                Err(e) => return Err(e), // TODO: return different error type
+                Err(e) => {
+                    state.extraction_done();
+                    return Err(e); // TODO: return different error type
+                }
             }
         }
         if let Err(e) = store.resolve(Arc::clone(&url), anchors) {

@@ -38,7 +38,7 @@ to compile `hakelig` at the time of writing.
 - [ ] Reasonable output and progress indication, probably taking
       [linkchecker] as a source of inspiration.
 
-- [ ] HTTP support.
+- [ ] HTTP `Content-Type` header support.
 
 [linkchecker]: https://linkchecker.github.io/linkchecker/
 
