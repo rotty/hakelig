@@ -62,7 +62,7 @@ impl From<str::Utf8Error> for ExtractError {
 }
 
 impl fmt::Display for ExtractError {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExtractError::Redirect(url) => write!(fmt, "redirect to {}", url),
             ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
