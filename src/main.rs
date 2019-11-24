@@ -15,13 +15,7 @@
 
 #![warn(rust_2018_idioms)]
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Error;
 use futures::{channel::mpsc, prelude::*};
@@ -33,11 +27,15 @@ use url::Url;
 
 mod entity;
 mod extract;
+mod queue;
 mod store;
 
-use entity::{Entity, EntityStream};
-use extract::{extraction_thread, ExtractTask};
-use store::{FoundUrl, Store};
+use crate::{
+    entity::{Entity, EntityStream},
+    extract::{extraction_thread, ExtractTask},
+    queue::QueueState,
+    store::{FoundUrl, Store},
+};
 
 #[derive(StructOpt)]
 struct Opt {
@@ -50,56 +48,6 @@ struct Opt {
         help = "Maximum number of recursions, set to negative to disable limit"
     )]
     recursion_limit: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct QueueState(Arc<QueueStateInner>);
-
-#[derive(Debug, Default)]
-struct QueueStateInner {
-    /// Wether the root-finding process is done
-    roots_done: AtomicBool,
-    /// How many tasks are queued for extraction
-    waiting: AtomicUsize,
-    /// How many extraction tasks are currently being processed
-    extracting: AtomicUsize,
-    /// How many URLs are waiting to be processed
-    queued: AtomicUsize,
-}
-
-impl QueueState {
-    pub fn new() -> Self {
-        QueueState::default()
-    }
-    pub fn is_done(&self) -> bool {
-        let inner = &self.0;
-        inner.roots_done.load(Ordering::SeqCst)
-            && inner.waiting.load(Ordering::SeqCst) == 0
-            && inner.extracting.load(Ordering::SeqCst) == 0
-            && inner.queued.load(Ordering::SeqCst) == 0
-    }
-    pub fn roots_done(&self) {
-        self.0.roots_done.store(true, Ordering::SeqCst)
-    }
-    pub fn extraction_enqueued(&self) {
-        self.0.waiting.fetch_add(1, Ordering::SeqCst);
-    }
-    pub fn extraction_dequeued(&self) {
-        self.0.extracting.fetch_add(1, Ordering::SeqCst);
-        let previous = self.0.waiting.fetch_sub(1, Ordering::SeqCst);
-        assert!(previous > 0);
-    }
-    pub fn extraction_done(&self) {
-        let previous = self.0.extracting.fetch_sub(1, Ordering::SeqCst);
-        assert!(previous > 0);
-    }
-    pub fn url_enqueued(&self) {
-        self.0.queued.fetch_add(1, Ordering::SeqCst);
-    }
-    pub fn url_dequeued(&self) {
-        let previous = self.0.queued.fetch_sub(1, Ordering::SeqCst);
-        assert!(previous > 0);
-    }
 }
 
 struct App {
