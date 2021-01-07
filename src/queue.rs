@@ -3,16 +3,6 @@ use std::sync::{
     Arc,
 };
 
-/// Handle to the various queue counters.
-///
-/// `QueueState` is a thread-safe handle to a queue; when cloned, a new handle
-/// to the same queue state will created.
-///
-/// The in addition to tracking whether root enumeration has completed, the
-/// queue state keeps a few atomic counters for various queues used. The it
-/// keeps is used both for progress indication, as well as for determining when
-/// a completion state is reached. See the `is_done` method documentation for
-/// for guidance on how to avoid messing this up.
 #[derive(Debug, Clone, Default)]
 pub struct QueueState(Arc<QueueStateInner>);
 
@@ -64,11 +54,6 @@ impl QueueState {
     /// Indicate a an extraction task has been enqueued.
     pub fn extraction_enqueued(&self) {
         self.0.waiting.fetch_add(1, Ordering::SeqCst);
-    }
-    /// Indicate an extraction has been cancelled.
-    pub fn extraction_cancelled(&self) {
-        let previous = self.0.waiting.fetch_sub(1, Ordering::SeqCst);
-        assert!(previous > 0);
     }
     /// Indicate that an extration has been started.
     pub fn extraction_dequeued(&self) {

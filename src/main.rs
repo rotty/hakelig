@@ -15,14 +15,18 @@
 
 #![warn(rust_2018_idioms)]
 
-use std::{sync::Arc, time::Duration};
+use std::{env, path::Path, sync::Arc, time::Duration};
 
-use anyhow::Error;
-use futures::{channel::mpsc, prelude::*};
+use futures::{future, StreamExt};
 use log::debug;
-use regex::RegexSet;
+use once_cell::sync::Lazy;
+use regex::{Regex, RegexSet};
 use structopt::StructOpt;
-use tokio::{runtime::Runtime, timer};
+use tokio::{
+    runtime::Runtime,
+    signal,
+    sync::{broadcast, mpsc},
+};
 use url::Url;
 
 mod entity;
@@ -30,12 +34,10 @@ mod extract;
 mod queue;
 mod store;
 
-use crate::{
-    entity::{Entity, EntityStream},
-    extract::{extraction_thread, ExtractTask},
-    queue::QueueState,
-    store::{FoundUrl, Store},
-};
+use entity::Entity;
+use extract::{extraction_thread, ExtractTask};
+use queue::QueueState;
+use store::{FoundUrl, Store};
 
 #[derive(StructOpt)]
 struct Opt {
@@ -45,267 +47,269 @@ struct Opt {
     #[structopt(
         short = "r",
         long = "recursion-limit",
-        help = "Maximum number of recursions, set to negative to disable limit"
+        help = "Maximum number of recursions"
     )]
     recursion_limit: Option<u32>,
 }
 
-struct App {
-    backend: Backend,
-    // TODO: get rid of `Option` here
-    task_source: Option<mpsc::Receiver<ExtractTask>>,
-    root_stream: Option<EntityStream>,
-    found_source: Option<mpsc::UnboundedReceiver<FoundUrl>>,
-    found_sink: mpsc::UnboundedSender<FoundUrl>,
-    store: Arc<Store>,
-    queue_state: QueueState,
+static URI_SCHEME: Lazy<Regex> = Lazy::new(|| Regex::new("^[a-z]+://").unwrap());
+
+fn parse_root<T: AsRef<str>>(root: T) -> anyhow::Result<Url> {
+    let root = root.as_ref();
+    if URI_SCHEME.is_match(root) {
+        Ok(Url::parse(root)?)
+    } else {
+        let path = Path::new(root);
+        if path.is_relative() {
+            let mut absolute = env::current_dir()?;
+            absolute.push(path);
+            Ok(Url::from_file_path(absolute).unwrap())
+        } else {
+            Ok(Url::from_file_path(path).unwrap())
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Backend {
-    task_sink: mpsc::Sender<ExtractTask>,
+    task_sink: async_channel::Sender<ExtractTask>,
     store: Arc<Store>,
     queue_state: QueueState,
     entity_ctx: Arc<entity::Context>,
+    done_tx: broadcast::Sender<()>,
 }
 
-async fn submit_chunks(
-    url: Arc<Url>,
-    mut chunks: entity::ChunkStream,
-    mut chunk_sink: mpsc::Sender<Vec<u8>>,
-) {
-    while let Some(chunk) = chunks.next().await {
-        match chunk {
-            Ok(chunk) => match chunk_sink.send(chunk).await {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("error submitting chunk for {}: {}", url, e);
-                    return;
-                }
-            },
-            Err(e) => {
-                eprintln!("error reading chunk for {}: {}", url, e);
-                return;
-            }
-        }
-    }
-}
-
-async fn submit_entities<S>(mut backend: Backend, mut entities: S)
-where
-    S: Stream<Item = Result<Box<dyn Entity>, Error>> + Unpin,
-{
-    while let Some(entity) = entities.next().await {
-        let entity = match entity {
-            Ok(entity) => entity,
-            Err(e) => {
-                eprintln!("could not submit entity: {}", e);
-                continue;
-            }
-        };
+impl Backend {
+    async fn submit_entity(&self, entity: Box<dyn Entity>) -> anyhow::Result<()> {
         let url = entity.url();
-        debug!("dequeued {}", url);
-        if !backend.store.touch(Arc::clone(&url)) {
-            backend.queue_state.url_dequeued();
+        debug!("dequeued {}", &url);
+        if !self.store.touch(Arc::clone(&url)) {
+            self.queue_state.url_dequeued();
             debug!("{} already in store", &url);
-            if backend.queue_state.is_done() {
-                break;
-            }
-            continue;
+            return Ok(());
         }
-        let url = entity.url();
-        let found_url = entity.found_url().clone();
-        debug!("queuing task for {}", &url);
-        // We need to increment the `enqueued` counter first, so that we avoid
-        // getting into the `done` state prematurely.
-        backend.queue_state.extraction_enqueued();
-        backend.queue_state.url_dequeued();
-        let read = entity.read(&backend.entity_ctx);
-        let chunks = match read.await {
+        let entity_ctx = self.entity_ctx.clone();
+        let mut chunks = match entity.read(entity_ctx).await {
             Ok((mime, chunks)) => {
-                match (mime.type_(), mime.subtype()) {
-                    (mime::TEXT, mime::HTML) => {}
-                    _ => {
-                        backend.queue_state.extraction_cancelled();
-                        debug!(
-                            "{}: ignoring non-HTML entity (MIME type {})",
-                            found_url, mime
-                        );
-                        if backend.queue_state.is_done() {
-                            break;
-                        }
-                        continue;
-                    }
+                if mime != mime::TEXT_HTML && mime != mime::TEXT_HTML_UTF_8 {
+                    debug!("{}: ignoring non-HTML entity (MIME type {})", url, mime);
+                    self.queue_state.url_dequeued();
+                    return Ok(());
                 }
                 chunks
             }
             Err(e) => {
-                eprintln!("failed to read from {}: {}", found_url, e);
-                backend.queue_state.extraction_cancelled();
-                if backend.queue_state.is_done() {
-                    break;
-                }
-                continue;
+                self.queue_state.url_dequeued();
+                eprintln!("cannot read from {}: {}", url, e);
+                return Ok(());
             }
         };
+        // We need to increment the `enqueued` counter first, so that we avoid
+        // getting into the `done` state prematurely.
+        self.queue_state.extraction_enqueued();
+        self.queue_state.url_dequeued();
         let (chunk_sink, chunk_source) = mpsc::channel(100);
+        let tasks = self.task_sink.clone();
+        debug!("queuing task for {}", &url);
+        tasks
+            .send(ExtractTask::new(entity.found_url().clone(), chunk_source))
+            .await?;
         debug!("queued {}", url);
-        match backend
-            .task_sink
-            .send(ExtractTask::new(found_url, chunk_source))
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                backend.queue_state.extraction_cancelled();
-                eprintln!("error submitting task for {}: {}", url, e);
-                if backend.queue_state.is_done() {
-                    break;
-                }
-                continue;
-            }
+        //tokio::pin!(chunks);
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            chunk_sink.send(chunk).await?;
         }
-        tokio::spawn(submit_chunks(Arc::clone(&url), chunks, chunk_sink));
-    }
-}
-
-impl App {
-    fn from_opt(opt: Opt) -> Result<Self, Error> {
-        let link_ignore_set = RegexSet::new(opt.link_ignore)?;
-        let (mut root_urls, root_stream) = entity::list_roots(opt.roots)?;
-        for url in &mut root_urls {
-            url.set_fragment(None);
-            url.set_query(None);
-            url.path_segments_mut().expect("cannot-be-base URL").pop();
-        }
-        let store = Arc::new(Store::new(
-            link_ignore_set,
-            Some(root_urls),
-            opt.recursion_limit,
-        ));
-        let (found_sink, found_source) = mpsc::unbounded();
-        let (task_sink, task_source) = mpsc::channel(10);
-        let entity_ctx = Arc::new(entity::Context::new());
-        let queue_state = QueueState::new();
-        Ok(App {
-            backend: Backend {
-                task_sink,
-                queue_state: queue_state.clone(),
-                store: store.clone(),
-                entity_ctx,
-            },
-            task_source: Some(task_source),
-            found_source: Some(found_source),
-            root_stream: Some(root_stream),
-            found_sink,
-            store,
-            queue_state,
-        })
+        debug!("done sending chunks {}", url);
+        Ok(())
     }
 
-    fn submit_roots(&self, root_stream: EntityStream) -> impl Future<Output = ()> + 'static + Send {
-        let root_enqueue_state = self.queue_state.clone();
-        let roots = root_stream.map_ok(move |entity| {
-            root_enqueue_state.url_enqueued();
-            entity
-        });
-        let roots_done_state = self.queue_state.clone();
-        let backend = self.backend.clone();
-        let found_sink = self.found_sink.clone();
-        async move {
-            submit_entities(backend, roots).await;
-            roots_done_state.roots_done();
-            if roots_done_state.is_done() {
-                found_sink.close_channel();
-            }
-        }
-    }
-
-    async fn submit_found(&self, found_source: mpsc::UnboundedReceiver<FoundUrl>) {
-        let found_state = self.queue_state.clone();
-        let backend = self.backend.clone();
-        let found = found_source.filter_map(move |url| {
-            let found_state = found_state.clone();
-            async move {
-                match entity::classify_url(url) {
-                    Err(_) => {
-                        // TODO: do not swallow error
-                        found_state.url_dequeued();
-                        None
+    async fn submit_roots(&self, root_urls: Vec<Url>) -> anyhow::Result<()> {
+        let mut root_list = entity::list_roots(&root_urls);
+        let mut done_rx = self.done_tx.subscribe();
+        loop {
+            let item = tokio::select! {
+                item = root_list.next() => {
+                    match item.transpose() {
+                        Some(item) => item,
+                        None => break,
                     }
-                    Ok(entity) => Some(Ok(entity)),
                 }
-            }
-        });
-        let found = Box::pin(found);
-        submit_entities(backend, found).await;
-        debug!("processing new URLs is done");
-        if self.queue_state.is_done() {
-            let mut task_sink = self.backend.task_sink.clone();
-            task_sink.close_channel();
-        }
-    }
-
-    fn run(&mut self) -> Result<(), Error> {
-        let root_stream = self.root_stream.take().unwrap();
-        let task_source = self.task_source.take().unwrap();
-        let found_source = self.found_source.take().unwrap();
-        let submit_roots = self.submit_roots(root_stream);
-        let submit_found = self.submit_found(found_source);
-        let task_executor = extraction_thread(
-            Arc::clone(&self.store),
-            task_source,
-            self.found_sink.clone(),
-            self.queue_state.clone(),
-        );
-        let state = self.queue_state.clone();
-        let queue_state_printer = async move {
-            let mut interval = timer::Interval::new_interval(Duration::from_millis(100));
-            while let Some(_instant) = interval.next().await {
-                eprintln!("queue state: {:?}", state);
-                if state.is_done() {
-                    break;
-                }
-            }
-        };
-        let runtime = Runtime::new()?;
-        let run = future::lazy(|_ctx| {
-            tokio::spawn(submit_roots);
-            tokio::spawn(queue_state_printer);
-        })
-        .then(|_| submit_found);
-        runtime.block_on(run);
-        debug!("done running frontend");
-        task_executor
-            .join()
-            .expect("joining extractor thread failed");
-        debug!("joined extract thread");
-        for (url, references) in self.store.lock().known_dangling() {
-            //let references: Vec<_> = references.iter().map(|u| u.as_str()).collect();
-            //let reference_count = references.count();
-            println!("{}:", url);
-            for (anchor, referrers) in references {
-                if referrers.is_empty() {
+                _ = done_rx.recv() => break,
+            };
+            let root = match item {
+                Err(e) => {
+                    eprintln!("Error listing roots: {}", e);
                     continue;
                 }
-                match anchor {
-                    Some(anchor) => println!("  references to {}", anchor),
-                    None => println!("  document references"),
+                Ok(root) => store::FoundUrl(Arc::new(root), 0),
+            };
+            let entity = match entity::classify_url(root.clone()) {
+                Ok(entity) => entity,
+                Err(e) => {
+                    // TODO: do not swallow error
+                    debug!("could not classify root {}: {}", root, e);
+                    continue;
                 }
-                for referrer in referrers {
-                    println!("    {}, href {}", referrer.url(), referrer.href());
+            };
+            self.queue_state.url_enqueued();
+            if let Err(e) = self.submit_entity(entity).await {
+                eprintln!("Error submitting roots: {}", e);
+            }
+        }
+        self.queue_state.roots_done();
+        debug!("Submitting roots done: {:?}", self.queue_state);
+        if self.queue_state.is_done() {
+            if let Err(e) = self.done_tx.send(()) {
+                debug!("Root submission failed tp notify completion: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_extracted_urls(
+        &self,
+        mut url_source: mpsc::UnboundedReceiver<FoundUrl>,
+    ) -> anyhow::Result<()> {
+        let mut done_rx = self.done_tx.subscribe();
+        loop {
+            if self.queue_state.is_done() {
+                if let Err(e) = self.done_tx.send(()) {
+                    debug!("Root submission failed tp notify completion: {}", e);
                 }
+                break;
+            }
+            let url = tokio::select! {
+                url = url_source.recv() => {
+                    match url {
+                        Some(url) => url,
+                        None => break,
+                    }
+                }
+                _ = done_rx.recv() => break,
+            };
+            let entity = match entity::classify_url(url.clone()) {
+                Ok(entity) => entity,
+                Err(_) => {
+                    // TODO: do not swallow error
+                    self.queue_state.url_dequeued();
+                    continue;
+                }
+            };
+            if let Err(e) = self.submit_entity(entity).await {
+                debug!("Failed to resolve entity {}: {}", url, e);
+                self.store
+                    .resolve_error(Arc::clone(&url.0), e.to_string())
+                    .unwrap_or_else(|e| {
+                        eprintln!("could not record failure for {}: {}", url, e);
+                    });
             }
         }
         Ok(())
     }
 }
 
-fn main() -> Result<(), Error> {
+async fn print_queue_state(state: QueueState, mut done_rx: broadcast::Receiver<()>) {
+    let mut timer = tokio::time::interval(Duration::from_millis(100));
+
+    loop {
+        eprintln!("queue state: {:?}", state);
+        tokio::select! {
+            _ = timer.tick() => {},
+            _ = done_rx.recv() => break,
+        }
+    }
+}
+
+async fn signal_handler(done_tx: broadcast::Sender<()>) -> anyhow::Result<()> {
+    signal::ctrl_c().await?;
+    debug!("Received Ctrl-C");
+    done_tx.send(())?;
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let opt = Opt::from_args();
-    let mut app = App::from_opt(opt)?;
-    app.run()?;
+    let link_ignore_set = RegexSet::new(opt.link_ignore)?;
+    let root_urls = opt
+        .roots
+        .iter()
+        .map(parse_root)
+        .collect::<anyhow::Result<Vec<Url>>>()?;
+    let mut parent_urls = root_urls.clone();
+    for url in &mut parent_urls {
+        url.set_fragment(None);
+        url.set_query(None);
+        url.path_segments_mut().expect("cannot-be-base URL").pop();
+    }
+    let store = Arc::new(Store::new(
+        link_ignore_set,
+        Some(parent_urls),
+        opt.recursion_limit,
+    ));
+    let queue_state = QueueState::new();
+    let (found_sink, found_source) = mpsc::unbounded_channel();
+    let (task_sink, task_source) = async_channel::bounded(10);
+    let entity_ctx = Arc::new(entity::Context::new());
+    let rt = Arc::new(Runtime::new()?);
+    let (done_tx, _) = broadcast::channel(1);
+    let backend = Backend {
+        task_sink,
+        queue_state: queue_state.clone(),
+        store: Arc::clone(&store),
+        entity_ctx,
+        done_tx: done_tx.clone(),
+    };
+    let root_submitter = backend.submit_roots(root_urls);
+    let extracted_processor = backend.process_extracted_urls(found_source);
+    debug!("Spawning {} extraction threads", num_cpus::get());
+    let task_executors: Vec<_> = (0..num_cpus::get())
+        .map(|i| {
+            debug!("Spawning extraction thread {}", i);
+            extraction_thread(
+                Arc::clone(&rt),
+                Arc::clone(&store),
+                task_source.clone(),
+                done_tx.clone(),
+                found_sink.clone(),
+                queue_state.clone(),
+            )
+        })
+        .collect();
+    rt.spawn(print_queue_state(queue_state, done_tx.subscribe()));
+    rt.spawn(async move {
+        if let Err(e) = signal_handler(done_tx.clone()).await {
+            eprintln!("Error in signal handler: {}", e);
+        }
+    });
+    if let Err(e) = rt.block_on(future::try_join(root_submitter, extracted_processor)) {
+        eprintln!("Submitting roots failed: {}", e);
+    }
+
+    for (i, executor) in task_executors.into_iter().enumerate() {
+        if let Err(e) = executor.join().expect("joining extractor thread failed") {
+            eprintln!("Task executor thread {} failed: {}", i, e);
+        }
+        debug!("Extraction thread {} completed successfully", i);
+    }
+
+    for (url, references) in store.lock().known_dangling() {
+        println!("{}:", url);
+        for (anchor, referrers) in references {
+            if referrers.is_empty() {
+                continue;
+            }
+            match anchor {
+                Some(anchor) => println!("  references to {}", anchor),
+                None => println!("  document references"),
+            }
+            for referrer in referrers {
+                println!("    {}, href {}", referrer.url(), referrer.href());
+            }
+        }
+    }
+
     Ok(())
 }

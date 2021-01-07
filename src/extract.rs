@@ -15,16 +15,23 @@
 
 use std::{collections::HashSet, fmt, str, sync::Arc, thread};
 
-use futures::{channel::mpsc, prelude::*};
-use html5ever::tokenizer::{
-    BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult,
+use futures::{future, Stream, StreamExt};
+use html5ever::{
+    tokenizer::{
+        BufferQueue, Tag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+        TokenizerResult,
+    },
+    Attribute,
 };
-use html5ever::Attribute;
 use log::debug;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tendril::StrTendril;
-use tokio::runtime::current_thread;
+use tokio::{
+    runtime::Runtime,
+    sync::{broadcast, mpsc},
+    task,
+};
 use url::Url;
 
 use crate::store::{FoundUrl, Store};
@@ -35,24 +42,9 @@ enum Extracted {
     Anchor(Box<str>),
 }
 
-#[derive(Debug)]
 enum ExtractError {
-    Redirect(Url), // TODO: this is not really an error
-    Recv(mpsc::TryRecvError),
-    Send(mpsc::SendError),
+    Redirect(Url),
     Utf8(str::Utf8Error),
-}
-
-impl From<mpsc::TryRecvError> for ExtractError {
-    fn from(recv: mpsc::TryRecvError) -> Self {
-        ExtractError::Recv(recv)
-    }
-}
-
-impl From<mpsc::SendError> for ExtractError {
-    fn from(send: mpsc::SendError) -> Self {
-        ExtractError::Send(send)
-    }
 }
 
 impl From<str::Utf8Error> for ExtractError {
@@ -65,58 +57,17 @@ impl fmt::Display for ExtractError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExtractError::Redirect(url) => write!(fmt, "redirect to {}", url),
-            ExtractError::Recv(e) => write!(fmt, "receiving failure: {}", e),
-            ExtractError::Send(e) => write!(fmt, "send failure: {}", e),
             ExtractError::Utf8(e) => write!(fmt, "invalid UTF8: {}", e),
         }
     }
 }
 
-fn from_utf8_partial(input: &[u8]) -> Result<(&str, &[u8]), str::Utf8Error> {
-    match str::from_utf8(input) {
-        Ok(s) => Ok((s, &[])),
-        Err(e) => {
-            let error_idx = e.valid_up_to();
-            if error_idx == 0 {
-                return Err(e);
-            }
-            let (valid, after_valid) = input.split_at(error_idx);
-            let s = unsafe { str::from_utf8_unchecked(valid) };
-            Ok((s, after_valid))
-        }
-    }
-}
+struct Redirect(Url);
 
-struct Extractor {
-    buffer_queue: BufferQueue,
-    tokenizer: Tokenizer<ExtractSink>,
-    buf: Vec<u8>,
-}
-
-impl Extractor {
-    fn new(base: Arc<Url>) -> Self {
-        Extractor {
-            buffer_queue: BufferQueue::new(),
-            tokenizer: Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default()),
-            buf: Vec::new(),
-        }
-    }
-
-    fn process_buf(&mut self, buf: Vec<u8>) -> Result<Vec<Extracted>, ExtractError> {
-        let (s, remainder) = if self.buf.is_empty() {
-            from_utf8_partial(&buf)?
-        } else {
-            self.buf.extend(buf);
-            from_utf8_partial(&self.buf)?
-        };
-        self.buffer_queue.push_back(StrTendril::from_slice(s));
-        if let TokenizerResult::Script(redirect) = self.tokenizer.feed(&mut self.buffer_queue) {
-            Err(ExtractError::Redirect(redirect.0))
-        } else {
-            self.buf = Vec::from(remainder); // TODO: This could be more efficient
-            Ok(self.tokenizer.sink.output.drain(0..).collect::<Vec<_>>())
-        }
-    }
+#[derive(Debug)]
+pub struct ExtractTask {
+    url: FoundUrl,
+    chunk_source: mpsc::Receiver<Vec<u8>>,
 }
 
 struct ExtractSink {
@@ -124,22 +75,20 @@ struct ExtractSink {
     output: Vec<Extracted>,
 }
 
-struct Redirect(Url);
+impl TokenSink for ExtractSink {
+    type Handle = Redirect;
 
-static CONTENT_REDIRECT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap());
-
-/// Checks for a `http-equiv=refresh` attribute and returns the URL inside the
-/// `content` attribute, if present.
-fn meta_refresh_url(attrs: &[Attribute]) -> Option<&str> {
-    attrs
-        .iter()
-        .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")?;
-    attr_value(attrs, "content").and_then(|content| {
-        CONTENT_REDIRECT_RE
-            .captures(content)
-            .map(|c| c.get(1).unwrap().as_str())
-    })
+    fn process_token(&mut self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
+        match token {
+            // TODO: XML namespace support
+            Token::TagToken(Tag {
+                ref name,
+                ref attrs,
+                ..
+            }) => self.extract_tag(name.as_ref(), attrs),
+            _ => TokenSinkResult::Continue,
+        }
+    }
 }
 
 impl ExtractSink {
@@ -173,6 +122,193 @@ impl ExtractSink {
     }
 }
 
+impl ExtractTask {
+    pub fn new(url: FoundUrl, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
+        ExtractTask { url, chunk_source }
+    }
+    async fn run(
+        self,
+        url_store: Arc<Store>,
+        url_sink: mpsc::UnboundedSender<FoundUrl>,
+        queue_state: super::QueueState,
+    ) -> Result<(), ExtractError> {
+        queue_state.extraction_dequeued();
+        let FoundUrl(url, level) = self.url.clone();
+        let extracted_level = level + 1;
+        let store_extracted = url_store.recurse_level(extracted_level);
+        let store = Arc::clone(&url_store);
+        let extracted_stream = extract(Arc::clone(&url), self.chunk_source);
+        tokio::pin!(extracted_stream);
+        let mut anchors = HashSet::new();
+        while let Some(extracted) = extracted_stream.next().await {
+            let extracted = match extracted {
+                Err(ExtractError::Utf8(e)) => {
+                    eprintln!("could not parse {}: {}", self.url, e);
+                    continue;
+                }
+                Err(ExtractError::Redirect(url)) => {
+                    store.add_redirect(Arc::clone(&self.url.0), Arc::new(url));
+                    continue;
+                }
+                Ok(extracted) => extracted,
+            };
+            match extracted {
+                Extracted::Link(link) => {
+                    if !store_extracted {
+                        continue;
+                    }
+                    if let Some(unknown_url) = store.add_link(Arc::clone(&self.url.0), link) {
+                        debug!(
+                            "submitting URL {}, extracted from {}",
+                            &unknown_url, &self.url
+                        );
+                        queue_state.url_enqueued();
+                        if let Err(e) = url_sink.send(FoundUrl(unknown_url, extracted_level)) {
+                            eprintln!("Could not send URL: {}", e);
+                            queue_state.url_dequeued();
+                        }
+                    }
+                }
+                Extracted::Anchor(anchor) => {
+                    anchors.insert(anchor);
+                }
+            }
+        }
+        queue_state.extraction_done();
+        Ok(())
+    }
+}
+
+async fn extraction_runner(
+    id: u32,
+    tasks: async_channel::Receiver<ExtractTask>,
+    store: Arc<Store>,
+    url_sink: mpsc::UnboundedSender<FoundUrl>,
+    done_tx: broadcast::Sender<()>,
+    mut done_rx: broadcast::Receiver<()>,
+    state: super::QueueState,
+) {
+    loop {
+        let task = tokio::select! {
+            task = tasks.recv() => {
+                match task {
+                    Ok(task) => task,
+                    Err(_) => break,
+                }
+            }
+            _ = done_rx.recv() => break,
+        };
+        debug!("Extraction runner {} got {:?}", id, task);
+        if let Err(e) = task
+            .run(Arc::clone(&store), url_sink.clone(), state.clone())
+            .await
+        {
+            eprintln!("Extraction task failed: {}", e)
+        }
+        if state.is_done() {
+            if let Err(e) = done_tx.send(()) {
+                eprintln!("Error notifying completion {}", e);
+            }
+            break;
+        }
+        debug!("Extraction runner {} finished a task", id);
+    }
+    debug!("Extraction runner {} terminated", id);
+}
+
+pub fn extraction_thread(
+    rt: Arc<Runtime>,
+    store: Arc<Store>,
+    tasks: async_channel::Receiver<ExtractTask>,
+    done_tx: broadcast::Sender<()>,
+    url_sink: mpsc::UnboundedSender<FoundUrl>,
+    state: super::QueueState,
+) -> thread::JoinHandle<anyhow::Result<()>> {
+    thread::spawn(move || {
+        debug!("Extraction thread running");
+        let local = task::LocalSet::new();
+        let task_handles = (0..4).map(|i| {
+            let extractor = extraction_runner(
+                i,
+                tasks.clone(),
+                Arc::clone(&store),
+                url_sink.clone(),
+                done_tx.clone(),
+                done_tx.subscribe(),
+                state.clone(),
+            );
+            local.spawn_local(extractor)
+        });
+        debug!("Extraction thread blocking");
+        local.block_on(&rt, future::join_all(task_handles));
+        debug!("Extraction thread terminating");
+        Ok(())
+    })
+}
+
+// We extract links by feeding chunks of data from a source channel into the
+// `html5ever` tokenizer, which is not `Send`. The reason to use a channel and
+// not an `AsyncRead` instance directly is that we want to use the tokio
+// threadpool runtime for the actual reading, so we can handle blocking disk
+// I/O, but cannot run the tokenizer inside the thread pool.
+fn extract(
+    base: Arc<Url>,
+    mut source: mpsc::Receiver<Vec<u8>>,
+) -> impl Stream<Item = Result<Extracted, ExtractError>> {
+    let mut queue = BufferQueue::new();
+    let mut tokenizer = Tokenizer::new(ExtractSink::new(base), TokenizerOpts::default());
+    let mut remainder = vec![];
+    async_stream::try_stream! {
+        while let Some(chunk) = source.recv().await {
+            let (s, rest) = if remainder.is_empty() {
+                from_utf8_partial(&chunk)?
+            } else {
+                remainder.extend(&chunk);
+                from_utf8_partial(&remainder)?
+            };
+            queue.push_back(StrTendril::from_slice(s));
+            if let TokenizerResult::Script(redirect) = tokenizer.feed(&mut queue) {
+                Err(ExtractError::Redirect(redirect.0))?;
+            }
+            remainder = Vec::from(rest);
+            for extracted in tokenizer.sink.output.drain(0..) {
+                yield extracted;
+            }
+        }
+    }
+}
+
+fn from_utf8_partial(input: &[u8]) -> Result<(&str, &[u8]), str::Utf8Error> {
+    match str::from_utf8(input) {
+        Ok(s) => Ok((s, &[])),
+        Err(e) => {
+            let error_idx = e.valid_up_to();
+            if error_idx == 0 {
+                return Err(e);
+            }
+            let (valid, after_valid) = input.split_at(error_idx);
+            let s = unsafe { str::from_utf8_unchecked(valid) };
+            Ok((s, after_valid))
+        }
+    }
+}
+
+static CONTENT_REDIRECT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(?i)[0-9]+\s*;\s*url=([^;]+)").unwrap());
+
+/// Checks for a `http-equiv=refresh` attribute and returns the URL inside the
+/// `content` attribute, if present.
+fn meta_refresh_url(attrs: &[Attribute]) -> Option<&str> {
+    attrs
+        .iter()
+        .find(|attr| &attr.name.local == "http-equiv" && attr.value.as_ref() == "refresh")?;
+    attr_value(attrs, "content").and_then(|content| {
+        CONTENT_REDIRECT_RE
+            .captures(content)
+            .map(|c| c.get(1).unwrap().as_str())
+    })
+}
+
 fn attr_value<'a, 'b>(attrs: &'a [Attribute], name: &'b str) -> Option<&'a str> {
     attrs.iter().find_map(|attr| {
         if &attr.name.local == name {
@@ -181,121 +317,4 @@ fn attr_value<'a, 'b>(attrs: &'a [Attribute], name: &'b str) -> Option<&'a str> 
             None
         }
     })
-}
-
-impl TokenSink for ExtractSink {
-    type Handle = Redirect;
-
-    fn process_token(&mut self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
-        match token {
-            // TODO: XML namespace support
-            Token::TagToken(Tag {
-                ref name,
-                ref attrs,
-                ..
-            }) => self.extract_tag(name.as_ref(), attrs),
-            _ => TokenSinkResult::Continue,
-        }
-    }
-}
-
-pub fn extraction_thread(
-    store: Arc<Store>,
-    tasks: mpsc::Receiver<ExtractTask>,
-    url_sink: mpsc::UnboundedSender<FoundUrl>,
-    state: super::QueueState,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut runtime = current_thread::Runtime::new().unwrap();
-        let extract = tasks.for_each_concurrent(20, move |task| {
-            let store = store.clone();
-            let url_sink = url_sink.clone();
-            let state = state.clone();
-            async move {
-                match task.run(store, url_sink, state).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("error running extraction: {}", e);
-                    }
-                }
-            }
-        });
-        runtime.spawn(extract);
-        runtime.run().unwrap_or_else(|e| {
-            eprintln!("error extracting links: {}", e);
-        });
-        debug!("extraction thread terminating");
-    })
-}
-
-pub struct ExtractTask {
-    url: FoundUrl,
-    chunk_source: mpsc::Receiver<Vec<u8>>,
-}
-
-impl ExtractTask {
-    pub fn new(url: FoundUrl, chunk_source: mpsc::Receiver<Vec<u8>>) -> Self {
-        ExtractTask { url, chunk_source }
-    }
-    async fn run(
-        mut self,
-        store: Arc<Store>,
-        mut url_sink: mpsc::UnboundedSender<FoundUrl>,
-        state: super::QueueState,
-    ) -> Result<(), ExtractError> {
-        state.extraction_dequeued();
-        let FoundUrl(url, level) = self.url.clone();
-        let extracted_level = level + 1;
-        let mut extractor = Extractor::new(url.clone());
-        let mut anchors = HashSet::new();
-        while let Some(chunk) = self.chunk_source.next().await {
-            let task_url = Arc::clone(&url);
-            match extractor.process_buf(chunk) {
-                Ok(items) => {
-                    for extracted in items {
-                        let task_url = Arc::clone(&task_url);
-                        match extracted {
-                            Extracted::Link(link) => {
-                                if !store.recurse_level(extracted_level) {
-                                    continue;
-                                }
-                                if let Some(unknown_url) =
-                                    store.add_link(Arc::clone(&task_url), link)
-                                {
-                                    debug!(
-                                        "submitting URL {}, extracted from {}",
-                                        unknown_url, task_url
-                                    );
-                                    state.url_enqueued();
-                                    url_sink
-                                        .send(FoundUrl(unknown_url, extracted_level))
-                                        .await?;
-                                }
-                            }
-                            Extracted::Anchor(anchor) => {
-                                anchors.insert(anchor);
-                            }
-                        }
-                    }
-                }
-                Err(ExtractError::Utf8(e)) => eprintln!("could not parse {}: {}", task_url, e),
-                Err(ExtractError::Redirect(url)) => {
-                    store.add_redirect(task_url, Arc::new(url));
-                }
-                Err(e) => {
-                    state.extraction_done();
-                    return Err(e); // TODO: return different error type
-                }
-            }
-        }
-        if let Err(e) = store.resolve(Arc::clone(&url), anchors) {
-            eprintln!("could not resolve {}: {}", url, e);
-        }
-        debug!("extraction for {} done ({:?})", url, state);
-        state.extraction_done();
-        if state.is_done() {
-            url_sink.close_channel();
-        }
-        Ok(())
-    }
 }

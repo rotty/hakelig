@@ -124,25 +124,38 @@ impl fmt::Display for Error {
     }
 }
 
-#[derive(Default)]
 struct Document {
-    anchors: AnchorSet,
+    resolved: Resolved,
     unresolved: References,
+}
+
+enum Resolved {
+    Success { anchors: AnchorSet },
+    Failure { msg: String },
 }
 
 impl Document {
     fn new(anchors: AnchorSet) -> Self {
         Document {
-            anchors,
+            resolved: Resolved::Success { anchors },
             unresolved: References::default(),
         }
     }
-}
-
-impl Document {
+    fn error(msg: String) -> Self {
+        Document {
+            resolved: Resolved::Failure { msg },
+            unresolved: References::default(),
+        }
+    }
+    fn has_anchor(&self, anchor: &str) -> bool {
+        match &self.resolved {
+            Resolved::Failure { .. } => false,
+            Resolved::Success { anchors } => anchors.contains(anchor),
+        }
+    }
     fn add_referrer(&mut self, anchor: Option<Box<str>>, referrer: Referrer) {
         if let Some(anchor) = anchor {
-            if !self.anchors.contains(&anchor) {
+            if !self.has_anchor(&anchor) {
                 self.unresolved.add_anchored(anchor, referrer);
             }
         }
@@ -152,7 +165,7 @@ impl Document {
         I: IntoIterator<Item = Referrer>,
     {
         if let Some(anchor) = anchor {
-            if !self.anchors.contains(&anchor) {
+            if !self.has_anchor(&anchor) {
                 self.unresolved.extend_anchored(anchor, referrers);
             }
         }
@@ -233,12 +246,16 @@ fn url_is_below(base: &Url, url: &Url) -> bool {
 }
 
 impl Store {
-    pub fn new(link_ignore: RegexSet, restrict: Option<Vec<Url>>, level: Option<u32>) -> Self {
+    pub fn new(
+        link_ignore: RegexSet,
+        restrict: Option<Vec<Url>>,
+        recursion_level: Option<u32>,
+    ) -> Self {
         Store {
             link_ignore,
             restrict_urls: restrict,
             inner: Mutex::new(StoreInner::default()),
-            recursion_level: level,
+            recursion_level,
         }
     }
     pub fn recurse_level(&self, level: u32) -> bool {
@@ -248,13 +265,16 @@ impl Store {
             true
         }
     }
-    pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
+    fn resolve_document<F>(&self, url: Arc<Url>, f: F) -> Result<(), Error>
+    where
+        F: FnOnce() -> Document,
+    {
         use hash_map::Entry;
         let mut guard = self.inner.lock().expect("store mutex poisoned");
         let references = guard.unknown.remove(&url);
         let doc = match guard.documents.entry(Arc::clone(&url)) {
             Entry::Occupied(_) => return Err(Error::DuplicateDocument),
-            Entry::Vacant(vacant) => vacant.insert(Document::new(anchors)),
+            Entry::Vacant(vacant) => vacant.insert(f()),
         };
         if let Some(references) = references {
             let (anchored, _) = references.into_inner();
@@ -263,6 +283,12 @@ impl Store {
             }
         }
         Ok(())
+    }
+    pub fn resolve(&self, url: Arc<Url>, anchors: HashSet<Box<str>>) -> Result<(), Error> {
+        self.resolve_document(url, move || Document::new(anchors))
+    }
+    pub fn resolve_error(&self, url: Arc<Url>, msg: String) -> Result<(), Error> {
+        self.resolve_document(url, move || Document::error(msg))
     }
     pub fn touch(&self, url: Arc<Url>) -> bool {
         let mut guard = self.inner.lock().expect("store mutex poisoned");
