@@ -50,6 +50,11 @@ struct Opt {
         help = "Maximum number of recursions"
     )]
     recursion_limit: Option<u32>,
+    #[structopt(
+        long = "extraction-threads",
+        help = "Number of threads to run extraction jobs on"
+    )]
+    n_extraction_threads: Option<usize>,
 }
 
 static URI_SCHEME: Lazy<Regex> = Lazy::new(|| Regex::new("^[a-z]+://").unwrap());
@@ -265,7 +270,8 @@ fn main() -> anyhow::Result<()> {
     let root_submitter = backend.submit_roots(root_urls);
     let extracted_processor = backend.process_extracted_urls(found_source);
     debug!("Spawning {} extraction threads", num_cpus::get());
-    let task_executors: Vec<_> = (0..num_cpus::get())
+    let n_extraction_threads = opt.n_extraction_threads.unwrap_or_else(|| num_cpus::get());
+    let task_executors: Vec<_> = (0..n_extraction_threads)
         .map(|i| {
             debug!("Spawning extraction thread {}", i);
             extraction_thread(
