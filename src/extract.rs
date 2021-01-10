@@ -130,6 +130,7 @@ impl ExtractTask {
         self,
         url_store: Arc<Store>,
         url_sink: mpsc::UnboundedSender<FoundUrl>,
+        mut done_rx: broadcast::Receiver<()>,
         queue_state: super::QueueState,
     ) -> Result<(), ExtractError> {
         queue_state.extraction_dequeued();
@@ -140,7 +141,17 @@ impl ExtractTask {
         let extracted_stream = extract(Arc::clone(&url), self.chunk_source);
         tokio::pin!(extracted_stream);
         let mut anchors = HashSet::new();
-        while let Some(extracted) = extracted_stream.next().await {
+        loop {
+            // TODO: Add timeout
+            let extracted = tokio::select! {
+                extracted = extracted_stream.next() => {
+                    match extracted {
+                        Some(extracted) => extracted,
+                        None => break,
+                    }
+                }
+                _ = done_rx.recv() => break,
+            };
             let extracted = match extracted {
                 Err(ExtractError::Utf8(e)) => {
                     eprintln!("could not parse {}: {}", self.url, e);
@@ -200,7 +211,12 @@ async fn extraction_runner(
         };
         debug!("Extraction runner {} got {:?}", id, task);
         if let Err(e) = task
-            .run(Arc::clone(&store), url_sink.clone(), state.clone())
+            .run(
+                Arc::clone(&store),
+                url_sink.clone(),
+                done_tx.subscribe(),
+                state.clone(),
+            )
             .await
         {
             eprintln!("Extraction task failed: {}", e)
