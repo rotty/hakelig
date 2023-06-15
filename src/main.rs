@@ -315,7 +315,7 @@ fn main() -> anyhow::Result<()> {
     let root_submitter = backend.submit_roots(root_urls);
     let extracted_processor = backend.process_extracted_urls(found_source);
     debug!("Spawning {} extraction threads", num_cpus::get());
-    let n_extraction_threads = opt.n_extraction_threads.unwrap_or_else(|| num_cpus::get());
+    let n_extraction_threads = opt.n_extraction_threads.unwrap_or_else(num_cpus::get);
     let task_executors: Vec<_> = (0..n_extraction_threads)
         .map(|i| {
             debug!("Spawning extraction thread {}", i);

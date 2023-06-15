@@ -325,7 +325,7 @@ fn meta_refresh_url(attrs: &[Attribute]) -> Option<&str> {
     })
 }
 
-fn attr_value<'a, 'b>(attrs: &'a [Attribute], name: &'b str) -> Option<&'a str> {
+fn attr_value<'a>(attrs: &'a [Attribute], name: &str) -> Option<&'a str> {
     attrs.iter().find_map(|attr| {
         if &attr.name.local == name {
             Some(attr.value.as_ref())

@@ -140,12 +140,11 @@ impl Context {
         }
     }
     pub async fn http_get(&self, url: &Url) -> reqwest::Result<reqwest::Response> {
-        Ok(self
-            .http_client
+        self.http_client
             .get(url.clone())
             .send()
             .await?
-            .error_for_status()?)
+            .error_for_status()
     }
 }
 
@@ -273,7 +272,7 @@ fn classify_path(path: &Path, level: u32) -> anyhow::Result<Box<dyn Entity>> {
         None => return Err(anyhow!("path without extension: {}", path.display())),
     };
     match ext {
-        "html" | "htm" => match HtmlPath::new(&path, level) {
+        "html" | "htm" => match HtmlPath::new(path, level) {
             Ok(entity) => Ok(Box::new(entity) as Box<dyn Entity>),
             Err(_) => Err(anyhow!(
                 "could not represent filename {} as an URL",

@@ -379,7 +379,7 @@ impl<'a> LockedStore<'a> {
 fn unknown_dangling<'a>(
     (url, references): (&'a Arc<Url>, &'a References),
 ) -> (&'a Url, bool, Vec<&'a Referrer>) {
-    (&url, false, references.referrers().collect())
+    (url, false, references.referrers().collect())
 }
 
 fn document_dangling<'a>(
@@ -388,7 +388,7 @@ fn document_dangling<'a>(
     if document.unresolved.is_empty() {
         None
     } else {
-        Some((&url, true, document.unresolved.referrers().collect()))
+        Some((url, true, document.unresolved.referrers().collect()))
     }
 }
 
@@ -407,7 +407,7 @@ fn document_known_dangling<'a>(
             .unresolved
             .anchored()
             .map(|(anchor, referrers)| (Some(anchor), referrers.collect()));
-        Some((&url, plain.chain(anchored)))
+        Some((url, plain.chain(anchored)))
     }
 }
 
