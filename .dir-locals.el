@@ -1,2 +1,1 @@
-((rust-mode . ((rust-format-on-save . t)
-                (fill-column . 80))))
+((rust-mode . ((fill-column . 80))))
