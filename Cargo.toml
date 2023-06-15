@@ -6,7 +6,7 @@ license = "GPL-2.0-or-later"
 repository = "https://r0tty.org/git/rust/hakelig"
 keywords = ["link", "checker", "html"]
 categories = ["command-line-utilities"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 anyhow = "1.0.37"
