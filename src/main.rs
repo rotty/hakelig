@@ -15,7 +15,7 @@
 
 #![warn(rust_2018_idioms)]
 
-use std::{env, path::Path, sync::Arc, time::Duration};
+use std::{env, fmt, io::Write, path::Path, sync::Arc, time::Duration};
 
 use futures::{future, StreamExt};
 use log::debug;
@@ -214,14 +214,59 @@ impl Backend {
     }
 }
 
-async fn print_queue_state(state: QueueState, mut done_rx: broadcast::Receiver<()>) {
+struct ShowQueueState {
+    state: QueueState,
+    tick: usize,
+}
+
+impl ShowQueueState {
+    fn new(state: QueueState) -> Self {
+        Self { state, tick: 0 }
+    }
+
+    fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+}
+
+impl fmt::Display for ShowQueueState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let spin_symbols = ['/', '-', '\\', '|'];
+        let root_spinner = if self.state.roots_are_done() {
+            '+'
+        } else {
+            spin_symbols[self.tick % spin_symbols.len()]
+        };
+        write!(
+            f,
+            "{} {waiting:5} waiting, {extracting:5} extracting, {queued:5} queued",
+            root_spinner,
+            waiting = self.state.waiting_count(),
+            extracting = self.state.extracting_count(),
+            queued = self.state.queued_count(),
+        )
+    }
+}
+
+async fn print_queue_state(
+    state: QueueState,
+    mut done_rx: broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
     let mut timer = tokio::time::interval(Duration::from_millis(100));
 
+    let mut stdout = std::io::stdout();
+    let mut state = ShowQueueState::new(state);
+    use crossterm::{cursor, style, QueueableCommand};
     loop {
-        eprintln!("queue state: {:?}", state);
+        stdout
+            .queue(cursor::SavePosition)?
+            .queue(style::Print(&state))?
+            .queue(cursor::RestorePosition)?;
+        stdout.flush()?;
+        state.tick();
         tokio::select! {
             _ = timer.tick() => {},
-            _ = done_rx.recv() => break,
+            _ = done_rx.recv() => break Ok(()),
         }
     }
 }

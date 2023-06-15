@@ -47,10 +47,29 @@ impl QueueState {
             && inner.extracting.load(Ordering::SeqCst) == 0
             && inner.queued.load(Ordering::SeqCst) == 0
     }
+
+    /// Returns whether the root-finding process has finished.
+    pub fn roots_are_done(&self) -> bool {
+        self.0.roots_done.load(Ordering::SeqCst)
+    }
+
     /// Indicate that the roots-finding proceess has finished.
     pub fn roots_done(&self) {
         self.0.roots_done.store(true, Ordering::SeqCst)
     }
+
+    pub fn waiting_count(&self) -> usize {
+        self.0.waiting.load(Ordering::SeqCst)
+    }
+
+    pub fn extracting_count(&self) -> usize {
+        self.0.extracting.load(Ordering::SeqCst)
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.0.queued.load(Ordering::SeqCst)
+    }
+
     /// Indicate a an extraction task has been enqueued.
     pub fn extraction_enqueued(&self) {
         self.0.waiting.fetch_add(1, Ordering::SeqCst);
