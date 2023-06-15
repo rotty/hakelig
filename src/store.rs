@@ -296,9 +296,6 @@ impl Store {
     }
 
     pub fn add_link(&self, document_url: Arc<Url>, href: Box<str>) -> Option<Arc<Url>> {
-        if self.link_ignore.is_match(&href) {
-            return None;
-        }
         let target = document_url
             .join(&href)
             .map_err(|_| {
@@ -306,7 +303,7 @@ impl Store {
                 eprintln!("could not parse link `{}'", href);
             })
             .ok()?;
-        if self.is_restricted(&target) {
+        if self.link_ignore.is_match(target.as_str()) || self.is_restricted(&target) {
             return None;
         }
         let mut guard = self.inner.lock().expect("store mutex poisoned");
